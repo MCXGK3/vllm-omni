@@ -21,11 +21,14 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.metrics.prometheus import OmniRequestCounter
+from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -122,6 +125,7 @@ class Orchestrator:
         *,
         async_chunk: bool = False,
         pd_config: dict[str, Any] | None = None,
+        running_counter: OmniRequestCounter | None = None,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -142,6 +146,34 @@ class Orchestrator:
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
         self.request_states: dict[str, OrchestratorRequestState] = {}
         self._cfg_tracker = CfgCompanionTracker()
+        self._running_counter = running_counter
+
+        vllm_config_for_stats = next(
+            (p.stage_vllm_config for p in stage_pools if p.stage_vllm_config is not None),
+                None,
+        )
+        # Build flat engine_idx ↔ (stage_id, replica_id) maps so that the wrap
+        # exposes the ~37 vllm:* families with per-(stage, replica) labels.
+        # The reverse map is consulted at record() time to find the engine_idx
+        # to update from the orchestrator's (stage_id, replica_id) loop.
+        stage_replica_map: dict[int, tuple[str, str]] = {}
+        self._stage_replica_to_engine_idx: dict[tuple[int, int], int] = {}
+        flat_idx = 0
+        for stage_id, pool in enumerate(stage_pools):
+            for replica_id in range(pool.num_replicas):
+                stage_replica_map[flat_idx] = (str(stage_id), str(replica_id))
+                self._stage_replica_to_engine_idx[(stage_id, replica_id)] = flat_idx
+                flat_idx += 1
+
+        if vllm_config_for_stats is not None:
+            self._stat_logger: OmniPrometheusStatLogger | None = OmniPrometheusStatLogger(
+                vllm_config=vllm_config_for_stats,
+                stage_replica_map=stage_replica_map,
+            )
+        else:
+            self._stat_logger = None
+        self._last_stats_ts: float = 0.0
+        self._stats_interval_s: float = 1.0
 
         self._shutdown_event = asyncio.Event()
         self._stages_shutdown = False
@@ -247,6 +279,8 @@ class Orchestrator:
             mm_features=getattr(prompt, "mm_features", None),
         )
         self.request_states[request_id] = req_state
+        if self._running_counter is not None:
+            self._running_counter.increment()
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
         req_state.stage_submit_ts[stage_id] = _time.time()
         enqueue_ts = msg.get("enqueue_ts", 0.0)
@@ -446,7 +480,23 @@ class Orchestrator:
                                     "new_prompt_len_snapshot",
                                     None,
                                 )
-                            raw_output = await pool.process_llm_raw_outputs(replica_id, raw_outputs)
+                            now = _time.monotonic()
+                            record_stats = (
+                                self._stat_logger is not None and now - self._last_stats_ts >= self._stats_interval_s
+                            )
+                            iteration_stats = IterationStats() if record_stats else None
+                            raw_output = await pool.process_llm_raw_outputs(
+                                replica_id,
+                                raw_outputs,
+                                iteration_stats=iteration_stats,
+                            )
+                            if record_stats:
+                                self._last_stats_ts = now
+                                self._stat_logger.record(
+                                    raw_outputs.scheduler_stats,
+                                    iteration_stats,
+                                    engine_idx=self._stage_replica_to_engine_idx[(stage_id, replica_id)],
+                                )
                         except asyncio.CancelledError:
                             raise
                         except EngineDeadError as e:
@@ -525,7 +575,7 @@ class Orchestrator:
                 )
                 stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
 
-            await self._route_output(stage_id, output, req_state, stage_metrics)
+            await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
 
     async def _handle_stage_error(self, stage_id: int, output: Any) -> None:
         """Emit a frontend-visible error and clean up request state."""
@@ -558,7 +608,8 @@ class Orchestrator:
         self._release_request_bindings(request_ids)
         for request_id in request_ids:
             self._pd_kv_params.pop(request_id, None)
-            self.request_states.pop(request_id, None)
+            if self.request_states.pop(request_id, None) is not None and self._running_counter is not None:
+                self._running_counter.decrement()
 
     def _maybe_clone_diffusion_params_for_cfg(self, request_id: str, params: Any) -> Any:
         """Attach CFG companion ids to diffusion sampling params when needed."""
@@ -580,6 +631,7 @@ class Orchestrator:
     async def _route_output(
         self,
         stage_id: int,
+        replica_id: int,
         output: Any,
         req_state: OrchestratorRequestState,
         stage_metrics: Any,
@@ -600,6 +652,7 @@ class Orchestrator:
                     "type": "output",
                     "request_id": req_id,
                     "stage_id": stage_id,
+                    "replica_id": replica_id,
                     "engine_outputs": output,
                     "metrics": stage_metrics,
                     "finished": finished and stage_id == req_state.final_stage_id,
@@ -612,6 +665,7 @@ class Orchestrator:
                     "type": "stage_metrics",
                     "request_id": req_id,
                     "stage_id": stage_id,
+                    "replica_id": replica_id,
                     "metrics": stage_metrics,
                     "stage_submit_ts": submit_ts,
                 }
