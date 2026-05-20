@@ -360,6 +360,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         This method is modified to stop the request immediately for the diffusion model.
         """
+        # logger.info("Updating scheduler from model runner output for %d requests, before processing num_running=%d, num_waiting=%d", len(scheduler_output.num_scheduled_tokens), len(self.running), len(self.waiting))
+        num_running_before_update = len(self.running)
+        num_waiting_before_update = len(self.waiting)
+        kv_cache_usage_before_update = self.kv_cache_manager.usage
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -581,14 +585,16 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     engine_core_outputs[client_index] = EngineCoreOutputs(finished_requests=finished_set)
             finished_req_ids.clear()
 
-        if (stats := self.make_stats(spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats)) is not None:
+        if (stats := self.make_stats(spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats,
+                                     num_running_before_update, num_waiting_before_update,
+                                       kv_cache_usage_before_update)) is not None:
             # Return stats to only one of the front-ends.
             if (eco := next(iter(engine_core_outputs.values()), None)) is None:
                 # We must return the stats even if there are no request
                 # outputs this step.
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
-
+        # logger.info("Updating scheduler from model runner output, after processing num_running=%d, num_waiting=%d", len(self.running), len(self.waiting))
         return engine_core_outputs
 
     def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:

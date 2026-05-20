@@ -286,6 +286,14 @@ class StagePool:
 
         if processed.reqs_to_abort:
             await client.abort_requests_async(processed.reqs_to_abort)
+        # logger.info(
+        #     "[StagePool] Processed raw outputs from stage-%s replica-%s: num_outputs=%d, reqs_to_abort=%s, scheduler_stats=%s",
+        #     self.stage_id,
+        #     replica_id,
+        #     len(raw_outputs.outputs),
+        #     processed.reqs_to_abort,
+        #     raw_outputs.scheduler_stats,
+        # )
 
         if raw_outputs.scheduler_stats is not None:
             processor.update_scheduler_stats(raw_outputs.scheduler_stats)

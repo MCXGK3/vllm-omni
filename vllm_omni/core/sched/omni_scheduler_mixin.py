@@ -37,12 +37,15 @@ class OmniSchedulerMixin:
             session.record_event(EngineCoreEventType.QUEUED)
 
     def make_stats(self, *args, **kwargs) -> SchedulerStats | None:
-        now = time.monotonic()
-        if now - getattr(self, "_last_stats_time", 0.0) < _STATS_INTERVAL_S:
-            return None
-        self._last_stats_time = now
+        # now = time.monotonic()
+        # if now - getattr(self, "_last_stats_time", 0.0) < _STATS_INTERVAL_S:
+        #     return None
+        # self._last_stats_time = now
+        kv_cache_usage = kwargs.pop("kv_cache_usage_before_update", self.kv_cache_manager.usage)
+        num_running = kwargs.pop("num_running_before_update", len(self.running))
+        num_waiting = kwargs.pop("num_waiting_before_update", len(self.waiting))
         return SchedulerStats(
-            kv_cache_usage=self.kv_cache_manager.usage,
-            num_running_reqs=len(self.running),
-            num_waiting_reqs=len(self.waiting),
-        )
+            kv_cache_usage=kv_cache_usage,
+            num_running_reqs=num_running,
+            num_waiting_reqs=num_waiting,
+        ) 
