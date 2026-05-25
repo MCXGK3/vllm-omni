@@ -42,6 +42,7 @@ from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
+from vllm_omni.utils.nvtx import nvtx_range, nvtx_mark
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
@@ -366,7 +367,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     scheduler_output,
                     encoder_cache=self.encoder_cache,
                 ) as ec_connector_output:
-                    self._execute_mm_encoder(scheduler_output)
+                    with nvtx_range("omni_ar:encoder_forward"):
+                        self._execute_mm_encoder(scheduler_output)
 
                     kv_ids = self.kv_extracted_req_ids
                     self.kv_extracted_req_ids = None
@@ -539,6 +541,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,  # OMNI: required for KV cache operations
             ),
+            nvtx_range("omni_ar:forward"),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
                 scheduler_output,

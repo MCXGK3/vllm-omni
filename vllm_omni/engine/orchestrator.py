@@ -30,6 +30,7 @@ from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.utils.nvtx import nvtx_range, nvtx_mark
 
 logger = init_logger(__name__)
 
@@ -250,6 +251,7 @@ class Orchestrator:
 
     async def _handle_add_request(self, msg: dict[str, Any]) -> None:
         """Handle an add_request message from the main thread."""
+        nvtx_mark("orchestrator:handle_add_request")
         stage_id = 0
         request_id = msg["request_id"]
         prompt = msg["prompt"]
@@ -289,6 +291,7 @@ class Orchestrator:
         preprocess_ms = msg.get("preprocess_ms", 0.0)
         if preprocess_ms > 0:
             req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
+        nvtx_mark("orchestrator:submit_initial")
         await self.stage_pools[stage_id].submit_initial(
             request_id,
             req_state,
@@ -304,6 +307,7 @@ class Orchestrator:
         stage_id = 0
         request_id = msg["request_id"]
         request = msg["prompt"]
+        nvtx_mark("orchestrator:handle_streaming_update")
 
         req_state = self.request_states.get(request_id)
         if req_state is None:
@@ -335,7 +339,7 @@ class Orchestrator:
         role = msg["role"]
         companion_prompt = msg["prompt"]
         sampling_params_list = msg["sampling_params_list"]
-
+        
         parent_state = self.request_states.get(parent_id)
         if parent_state is None:
             logger.info(
@@ -465,7 +469,8 @@ class Orchestrator:
                         idle = False
                     else:
                         try:
-                            raw_outputs = await pool.poll_llm_raw_output(replica_id, timeout_s=0.001)
+                            with nvtx_range("orchestrator:poll_output"):
+                                raw_outputs = await pool.poll_llm_raw_output(replica_id, timeout_s=0.001)
                             if raw_outputs is None:
                                 continue
 
@@ -949,11 +954,12 @@ class Orchestrator:
             )[req_id] = req_state.pd_prefill_multimodal_output
 
         try:
-            next_inputs = next_client.process_engine_inputs(
-                source_outputs,
-                req_state.prompt,
-                streaming_context=req_state.streaming,
-            )
+            with nvtx_range("orchestrator:forward_to_next"):
+                next_inputs = next_client.process_engine_inputs(
+                    source_outputs,
+                    req_state.prompt,
+                    streaming_context=req_state.streaming,
+                )
         except Exception:
             logger.exception(
                 "[Orchestrator] req=%s process_engine_inputs FAILED for stage-%s",
@@ -979,9 +985,11 @@ class Orchestrator:
 
             request.external_req_id = request.request_id
             if already_submitted:
-                await next_pool.submit_update(req_id, req_state, request)
+                with nvtx_range("orchestrator:submit_update"):
+                    await next_pool.submit_update(req_id, req_state, request)
             else:
-                await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+                with nvtx_range("orchestrator:submit_initial"):
+                    await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
 
         req_state.stage_submit_ts[next_logical] = _time.time()
 
