@@ -461,7 +461,8 @@ class Orchestrator:
                         return
 
                     if pool.stage_type == "diffusion":
-                        output = pool.poll_diffusion_output(replica_id)
+                        with nvtx_range("orchestrator:poll_diffusion_output"):
+                            output = pool.poll_diffusion_output(replica_id)
                         if output is None:
                             continue
 
@@ -469,7 +470,7 @@ class Orchestrator:
                         idle = False
                     else:
                         try:
-                            with nvtx_range("orchestrator:poll_output"):
+                            with nvtx_range("orchestrator:poll_llm_output"):
                                 raw_outputs = await pool.poll_llm_raw_output(replica_id, timeout_s=0.001)
                             if raw_outputs is None:
                                 continue
