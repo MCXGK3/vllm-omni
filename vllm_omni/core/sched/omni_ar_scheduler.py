@@ -13,7 +13,7 @@ from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMSchedu
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.core.sched.utils import remove_all
-from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
@@ -193,6 +193,21 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         nvtx_mark("omni_ar:schedule_start")
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
+            # Reset queue-time tracking for pre-warmed requests that just
+            # received their first real chunk.  The pre-warm dummy request
+            # fires a QUEUED event too early (before upstream data exists);
+            # clearing events and re-recording QUEUED makes the subsequent
+            # SCHEDULED meaningful — queue_time then measures wait from
+            # real-data-ready until the scheduler admits the request.
+            for req_id in self.chunk_transfer_adapter.requests_with_ready_chunks:
+                request = self.requests.get(req_id)
+                if request is None:
+                    continue
+                if getattr(request, "_omni_first_real_chunk_handled", False):
+                    continue
+                request.events.clear()
+                request.record_event(EngineCoreEventType.QUEUED)
+                request._omni_first_real_chunk_handled = True
 
         try:
             with nvtx_range("omni:base_schedule"):
