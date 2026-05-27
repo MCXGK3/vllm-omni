@@ -985,6 +985,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     payload.update(mm_payload)
                 # Flatten nested dicts to dotted keys so pooling_output
                 # stays dict[str, torch.Tensor] for msgspec serialization.
+                # import pickle as _pkl                                                                                                                                                                                                
+                # import torch as _torch                                                                                                                                                                                               
+                # _payload_info = {}                                                                                                                                                                                                   
+                # for _k, _v in payload.items():                                                                                                                                                                                       
+                #     if isinstance(_v, _torch.Tensor):                                                                                                                                                                                
+                #         _payload_info[_k] = f"Tensor(shape={list(_v.shape)}, dtype={_v.dtype}, size={_v.element_size()*_v.numel()//1024}KB)"                                                                                         
+                #     else:                                                                                                                                                                                                            
+                #         _payload_info[_k] = type(_v).__name__                                                                                                                                                                        
+                # _total = len(_pkl.dumps(flatten_payload(payload)))                                                                                                                                                                   
+                # logger.warning("[Rank-%s] req=%s pooler_payload: %s | total_pickle=%sKB",                                                                                                                                            
+                #                 getattr(self, 'rank', '?'), rid, _payload_info, _total // 1024)
                 pooler_output.append(flatten_payload(payload))
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.routed_experts_initialized:
