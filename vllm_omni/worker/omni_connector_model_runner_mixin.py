@@ -520,14 +520,36 @@ class OmniConnectorModelRunnerMixin:
             return dict(payload)
         return payload
 
-    def _broadcast_tp_payload_packet(self, packet: Any) -> Any:
-        """Broadcast one ordinary payload packet from TP rank 0 when TP is active."""
-        tp_group = self._get_local_tp_group()
-        if tp_group is None or getattr(tp_group, "world_size", 1) <= 1:
-            return packet
-        leader_packet = packet if self.is_data_transfer_rank() else None
-        return tp_group.broadcast_object(leader_packet, src=0)
+    # def _broadcast_tp_payload_packet(self, packet: Any) -> Any:
+    #     """Broadcast one ordinary payload packet from TP rank 0 when TP is active."""
+    #     tp_group = self._get_local_tp_group()
+    #     if tp_group is None or getattr(tp_group, "world_size", 1) <= 1:
+    #         return packet
+    #     leader_packet = packet if self.is_data_transfer_rank() else None
+    #     return tp_group.broadcast_object(leader_packet, src=0)
 
+    def _broadcast_tp_payload_packet(self, packet: Any) -> Any:
+        """Broadcast one ordinary payload packet from TP rank 0 when TP is active."""                                                                                                  
+        tp_group = self._get_local_tp_group()                                                                                                                         
+        if tp_group is None or getattr(tp_group, "world_size", 1) <= 1:                                                                                               
+            return packet                                                                                                                                             
+        leader_packet = packet if self.is_data_transfer_rank() else None                                                                                              
+        import time                                                                                                                                                   
+        t0 = time.time()                                                                                                                                              
+        result = tp_group.broadcast_object(leader_packet, src=0)                                                                                                      
+        elapsed = (time.time() - t0) * 1000                                                                                                                           
+        if self.is_data_transfer_rank():                                                                                                                              
+            logger.warning(                                                                                                                                           
+                "[Stage-%s] TP BCAST broadcast_object writer elapsed_ms=%.1f",                                                                                        
+                self._stage_id, elapsed,                                                                                                                              
+            )                                                                                                                                                         
+        else:                                                                                                                                                         
+            logger.warning(                                                                                                                                           
+                "[Stage-%s] TP BCAST broadcast_object reader elapsed_ms=%.1f",                                                                                        
+                self._stage_id, elapsed,                                                                                                                              
+            )                                                                                                                                                         
+        return result
+    
     def _apply_staged_payloads_locked(self, staged_payloads: dict[str, Any]) -> None:
         for req_id, payload in staged_payloads.items():
             self._local_stage_payload_cache[req_id] = self._snapshot_payload(payload)
@@ -1321,6 +1343,19 @@ class OmniConnectorModelRunnerMixin:
                     fanout_packet = self._collect_async_chunk_fanout_packet_locked()
             else:
                 fanout_packet = None
+
+            if self.is_data_transfer_rank():                                                                                                                          
+                  import pickle, time                                                                                                                                   
+                  t0 = time.time()                                                                                                                                      
+                  try:                                                                                                                                                  
+                      pkl_size = len(pickle.dumps(fanout_packet))                                                                                                       
+                  except Exception:                                                                                                                                     
+                      pkl_size = -1                                                                                                                                     
+                  elapsed = time.time() - t0                                                                                                                            
+                  logger.warning(                                                                                                                                       
+                      "[Stage-%s] TP BCAST fanout_packet is_none=%s pickle_size=%s pickle_time_ms=%.1f",                                                                
+                      self._stage_id, fanout_packet is None, pkl_size, elapsed * 1000,                                                                                  
+                  )
             fanout_packet = self._broadcast_tp_payload_packet(fanout_packet)
             if fanout_packet is None:
                 newly_finished = set()
@@ -1455,8 +1490,8 @@ class OmniConnectorModelRunnerMixin:
                 if self._stop_event.is_set():
                     break
                 try:
-                    nvtx_mark("omni:recv_loop")
-                    made_progress = self._poll_single_request(req_id) or made_progress
+                    with nvtx_range("omni:recv_loop"):
+                        made_progress = self._poll_single_request(req_id) or made_progress
                 except Exception:
                     logger.warning("Error receiving data for %s", req_id, exc_info=True)
 
@@ -1483,8 +1518,8 @@ class OmniConnectorModelRunnerMixin:
             if task is not None:
                 success = False
                 try:
-                    nvtx_mark("omni:save_loop")
-                    success = self._send_single_request(task)
+                    with nvtx_range("omni:save_loop"):
+                        success = self._send_single_request(task)
                 except Exception:
                     logger.error(
                         "Error saving data for %s",
@@ -1492,7 +1527,8 @@ class OmniConnectorModelRunnerMixin:
                         exc_info=True,
                     )
                 if not success:
-                    self._requeue_or_drop_failed_send(task)
+                    with nvtx_range("omni:save_requeue"):
+                        self._requeue_or_drop_failed_send(task)
                 continue
 
             self._work_available.wait(timeout=0.01)
