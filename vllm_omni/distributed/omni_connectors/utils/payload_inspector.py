@@ -169,7 +169,8 @@ def _classify_payload(state: dict, obj: Any) -> str:
         return "metadata"
 
     # Small scalar dicts
-    if "dict" in types and state["payload_size_bytes"] == 0:
+    total = state["cpu_tensor_bytes"] + state["gpu_tensor_bytes"] + state["bytes_size"] + state["numpy_bytes"]
+    if "dict" in types and total == 0:
         return "control"
 
     return "unknown"
