@@ -62,7 +62,7 @@ class OmniConnectorProfiler:
 
         if self._enabled:
             self._open_file()
-            atexit.register(self.flush)
+            atexit.register(self._close)
 
     def _open_file(self) -> None:
         try:
@@ -102,9 +102,7 @@ class OmniConnectorProfiler:
         self.flush()
 
     def flush(self) -> None:
-        """Flush all buffered events to disk."""
-        if self._flushed:
-            return
+        """Flush buffered events to disk. Keeps the file open for future writes."""
         with self._write_lock:
             if self._buffer and self._file is not None:
                 try:
@@ -114,8 +112,15 @@ class OmniConnectorProfiler:
                 except Exception:
                     pass
                 self._buffer.clear()
-            if self._file is not None and not self._buffer:
-                self._flushed = True
+
+    def _close(self) -> None:
+        """Close the output file. Called by atexit only."""
+        if self._flushed:
+            return
+        self._flushed = True
+        self.flush()
+        with self._write_lock:
+            if self._file is not None:
                 try:
                     self._file.close()
                 except Exception:
@@ -128,7 +133,7 @@ def get_connector_profiler() -> OmniConnectorProfiler:
     return OmniConnectorProfiler()
 
 
-def profiled_put(connector, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple:
+def profiled_put(connector, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
     """Wrapper around connector.put() with profiling."""
     profiler = get_connector_profiler()
     t0 = time.perf_counter_ns()

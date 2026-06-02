@@ -10,6 +10,18 @@ from typing import Any
 
 import torch
 
+try:
+    from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
+except ImportError:
+    OmniSerializer = None
+
+try:
+    from vllm_omni.entrypoints.stage_utils import shm_write_bytes as _shm_write_bytes
+    from vllm_omni.entrypoints.stage_utils import shm_read_bytes as _shm_read_bytes
+except ImportError:
+    _shm_write_bytes = None
+    _shm_read_bytes = None
+
 # Path labels used throughout experiments
 PATH_LABELS = {
     "inline": "Inline / Queue Baseline",
@@ -76,27 +88,27 @@ def sync_cuda() -> None:
 
 def serialize_payload(obj: Any) -> bytes:
     """Serialize using the OmniSerializer."""
-    from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
-
+    if OmniSerializer is None:
+        raise ImportError("vllm_omni not available for serialization")
     return OmniSerializer.serialize(obj)
 
 
 def deserialize_payload(data: bytes) -> Any:
     """Deserialize using the OmniSerializer."""
-    from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
-
+    if OmniSerializer is None:
+        raise ImportError("vllm_omni not available for deserialization")
     return OmniSerializer.deserialize(data)
 
 
 def shm_write(data: bytes, name: str | None = None) -> dict[str, Any]:
     """Write bytes to POSIX shared memory."""
-    from vllm_omni.entrypoints.stage_utils import shm_write_bytes
-
-    return shm_write_bytes(data, name=name)
+    if _shm_write_bytes is None:
+        raise ImportError("vllm_omni SHM utilities not available")
+    return _shm_write_bytes(data, name=name)
 
 
 def shm_read(meta: dict[str, Any]) -> bytes:
     """Read bytes from POSIX shared memory."""
-    from vllm_omni.entrypoints.stage_utils import shm_read_bytes
-
-    return shm_read_bytes(meta)
+    if _shm_read_bytes is None:
+        raise ImportError("vllm_omni SHM utilities not available")
+    return _shm_read_bytes(meta)
