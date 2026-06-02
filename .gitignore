@@ -171,6 +171,7 @@ CLAUDE.md
 !.claude/skills/review-pr/SKILL.md
 !.claude/skills/review-pr/references/
 !.claude/skills/review-pr/references/*.md
+TASK.md
 
 # Codex
 AGENTS.md
