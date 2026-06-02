@@ -21,8 +21,9 @@ import torch
 # Thresholds derived from M2-B experiments on A100 + Xeon Gold 6442Y
 # These should be re-calibrated when hardware changes.
 THRESHOLDS = {
-    "small_payload": 64 * 1024,        # 64KB — below this, inline/pickle is faster than SHM
-    "large_cpu_tensor": 1 * 1024 * 1024,  # 1MB — above this, raw SHM beats serialized SHM
+    "small_payload": 64 * 1024,             # 64KB — below this, inline beats SHM for CPU payloads
+    "cpu_raw_shm_min": 16 * 1024,           # 16KB — above this, raw SHM beats serialized SHM for CPU tensors
+    "gpu_cuda_ipc_min": 16 * 1024 * 1024,   # 16MB — above this, CUDA IPC beats serialized SHM for GPU tensors
 }
 
 
@@ -116,31 +117,39 @@ class ExperimentalPayloadAwareDispatcher:
         """Select the best communication path for a given payload.
 
         Priority rules (from M2-B data):
-        1. GPU-resident tensor → CUDA IPC (same node) or Mooncake (cross-node)
-        2. Small CPU payload → Inline (avoid SHM overhead)
-        3. Large CPU tensor → Raw SHM (bypass serialization)
-        4. Fallback → Serialized SHM
+        1. Mixed GPU payloads → CUDA IPC (dict serialization dominates SHM path at all sizes)
+        2. Large GPU tensor (≥16MB) → CUDA IPC
+        3. Small CPU payload (≤64KB) → Inline
+        4. CPU tensor (≥16KB) → Raw SHM
+        5. Fallback → Serialized SHM
         """
         size = payload_info.payload_size_bytes
         is_gpu = payload_info.contains_gpu_tensor or payload_info.memory_location in ("gpu", "mixed")
+        is_mixed = payload_info.payload_type_summary == "mixed"
 
-        # Rule 1: GPU tensors
-        if is_gpu:
+        # Rule 1: Mixed GPU payloads (dict containing GPU tensor) → CUDA IPC at any size
+        # Data: serialized SHM must pickle the containing dict, making it
+        # 15-80× slower than CUDA IPC even for small GPU tensors in a dict.
+        if is_gpu and is_mixed and "cuda_ipc" in available_backends:
+            return "cuda_ipc"
+
+        # Rule 2: Large GPU tensors → CUDA IPC (crosses over at 16MB)
+        if is_gpu and size >= THRESHOLDS["gpu_cuda_ipc_min"]:
             if self.topology.same_node and "cuda_ipc" in available_backends:
                 return "cuda_ipc"
             if self.topology.rdma_available and "mooncake" in available_backends:
                 return "mooncake"
             return "serialized_shm"
 
-        # Rule 2: Small CPU payload
-        if size <= THRESHOLDS["small_payload"] and "inline" in available_backends:
+        # Rule 3: Small non-GPU payload → Inline
+        if not is_gpu and size <= THRESHOLDS["small_payload"] and "inline" in available_backends:
             return "inline"
 
-        # Rule 3: Large CPU tensor
-        if size >= THRESHOLDS["large_cpu_tensor"] and "raw_shm" in available_backends:
+        # Rule 4: Non-GPU tensor ≥16KB → Raw SHM
+        if not is_gpu and size >= THRESHOLDS["cpu_raw_shm_min"] and "raw_shm" in available_backends:
             return "raw_shm"
 
-        # Rule 4: Fallback
+        # Rule 5: Fallback → Serialized SHM (covers small GPU tensors, mid-size CPU payloads)
         return "serialized_shm"
 
     def log_decision(self, **kwargs) -> None:
@@ -171,9 +180,9 @@ def validate_dispatcher() -> None:
         ("cpu_tensor_64kb", torch.randn(16384, device="cpu"), "inline"),
         ("cpu_tensor_1mb", torch.randn(262144, device="cpu"), "raw_shm"),
         ("cpu_tensor_64mb", torch.randn(16777216, device="cpu"), "raw_shm"),
-        ("gpu_tensor_4kb", torch.randn(1024, device="cuda"), "cuda_ipc"),
+        ("gpu_tensor_4kb", torch.randn(1024, device="cuda"), "serialized_shm"),
         ("gpu_tensor_64mb", torch.randn(16777216, device="cuda"), "cuda_ipc"),
-        ("mixed_gpu", {"tensor": torch.randn(1024, device="cuda"), "meta": "data"}, "cuda_ipc"),
+        ("mixed_gpu_small", {"tensor": torch.randn(1024, device="cuda"), "meta": "data"}, "cuda_ipc"),
     ]
 
     for name, payload, expected in test_cases:

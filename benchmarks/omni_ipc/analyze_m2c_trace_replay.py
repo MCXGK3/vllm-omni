@@ -208,15 +208,21 @@ def strategy_oracle(trace_payload: dict, curves: list[PathCurve]) -> tuple[str, 
 
 
 def _auto_small_threshold(curves: list[PathCurve]) -> int:
-    """Find crossover where Serialized SHM becomes better than Inline."""
+    """Find crossover where Serialized SHM becomes better than Inline for metadata.
+
+    Returns the smallest size where SHM beats Inline, or the max tested size if Inline always wins.
+    """
     inline_meta = [c for c in curves if c.path_name == "inline" and c.payload_type == "metadata"]
     shm_meta = [c for c in curves if c.path_name == "serialized_shm" and c.payload_type == "metadata"]
     if inline_meta and shm_meta:
         for size in inline_meta[0].sizes_bytes:
             il = inline_meta[0].latency_for(size)
             sl = shm_meta[0].latency_for(size)
-            if il is not None and sl is not None and sl <= il:
+            if il is not None and sl is not None and sl < il:
                 return size
+        # If Inline wins at all tested sizes, return the largest size + 1
+        # to effectively disable the inline path for larger payloads
+        return inline_meta[0].sizes_bytes[-1]
     return DEFAULT_SMALL_THRESHOLD
 
 
@@ -228,8 +234,10 @@ def _auto_large_cpu_threshold(curves: list[PathCurve]) -> int:
         for size in ser[0].sizes_bytes:
             rl = raw[0].latency_for(size)
             sl = ser[0].latency_for(size)
-            if rl is not None and sl is not None and rl <= sl:
+            if rl is not None and sl is not None and rl < sl:
                 return size
+        # If raw SHM wins at all sizes, return the smallest tested size
+        return ser[0].sizes_bytes[0]
     return DEFAULT_LARGE_CPU_THRESHOLD
 
 
@@ -470,15 +478,21 @@ def _make_synthetic_curves() -> list[PathCurve]:
 def output_choose_path_function(output_dir: str, curves: list[PathCurve]) -> None:
     """Output a recommended dispatch function based on experimental data."""
     small_threshold = _auto_small_threshold(curves)
-    large_cpu_threshold = _auto_large_cpu_threshold(curves)
+    cpu_raw_shm_threshold = _auto_large_cpu_threshold(curves)
+    # GPU CUDA IPC crossover at 16MB from M2-B data
+    gpu_ipc_threshold = 16 * 1024 * 1024
 
     code = f'''
 def choose_path(payload: Any, topology: dict, available_backends: list[str]) -> str:
     """Payload-aware communication path selection.
 
-    Thresholds derived from M2-B microbenchmarks:
-      small_threshold = {small_threshold} bytes ({small_threshold/1024:.0f} KB)
-      large_cpu_threshold = {large_cpu_threshold} bytes ({large_cpu_threshold/1024:.0f} MB)
+    Thresholds derived from M2-B microbenchmarks (A100-PCIE + Xeon 6442Y):
+      inline_max        = {small_threshold} bytes ({small_threshold/1024:.0f} KB) — inline beats SHM for CPU payloads
+      cpu_raw_shm_min   = {cpu_raw_shm_threshold} bytes ({cpu_raw_shm_threshold/1024:.0f} KB) — raw SHM beats serialized SHM
+      gpu_cuda_ipc_min  = {gpu_ipc_threshold} bytes ({gpu_ipc_threshold/1024/1024:.0f} MB) — CUDA IPC beats SHM for GPU tensors
+
+    These thresholds are hardware-dependent and should be re-calibrated
+    when GPU topology (NVLink vs PCIe), CPU, or /dev/shm changes.
 
     This is a recommendation only - do NOT directly modify production code.
     """
@@ -488,18 +502,20 @@ def choose_path(payload: Any, topology: dict, available_backends: list[str]) -> 
     size = info["payload_size_bytes"]
     is_gpu = info["contains_gpu_tensor"] or info["memory_location"] in ("gpu", "mixed")
 
-    # Rule 1: GPU-resident tensors → CUDA IPC (same node) or Mooncake (cross-node)
-    if is_gpu and "cuda_ipc" in available_backends:
+    # Rule 1: Large GPU-resident tensors → CUDA IPC
+    # Data: CUDA IPC wins for GPU tensors >= {gpu_ipc_threshold} bytes.
+    # Below that, serialized SHM is faster (CUDA IPC handshake ~15-20ms).
+    if is_gpu and size >= {gpu_ipc_threshold} and "cuda_ipc" in available_backends:
         return "cuda_ipc"
-    if is_gpu and "mooncake" in available_backends:
+    if is_gpu and size >= {gpu_ipc_threshold} and "mooncake" in available_backends:
         return "mooncake"
 
-    # Rule 2: Small CPU metadata → Inline (avoid SHM overhead)
+    # Rule 2: Small payloads → Inline (avoid SHM syscall overhead)
     if size <= {small_threshold} and "inline" in available_backends:
         return "inline"
 
-    # Rule 3: Large CPU tensors → Raw SHM (bypass serialization)
-    if size >= {large_cpu_threshold} and "raw_shm" in available_backends:
+    # Rule 3: CPU tensors → Raw SHM (bypass pickle serialization)
+    if size >= {cpu_raw_shm_threshold} and "raw_shm" in available_backends:
         return "raw_shm"
 
     # Rule 4: Fallback → existing Serialized SHM
