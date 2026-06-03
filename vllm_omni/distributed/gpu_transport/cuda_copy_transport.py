@@ -1,0 +1,168 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+"""Strategy 2: Eager P2P copy via CUDA IPC + cudaMemcpy.
+
+Consumer opens producer's allocation via IPC, immediately copies data
+to a local tensor on the destination GPU using a dedicated CUDA stream,
+then sends copy_done ACK so the producer can release the original tensor.
+Consumer uses its local copy — no further dependency on producer allocation.
+"""
+from __future__ import annotations
+
+import time
+import uuid
+
+import torch
+
+from .protocol import GPUTensorTransport, TensorMetadata, TransportHandle
+from .config import GPUTransportConfig
+from .tensor_registry import TensorRegistry
+from .ipc_utils import extract_ipc_args, rebuild_from_ipc_args
+from .logging import get_logger
+
+logger = get_logger(__name__)
+
+
+class CudaCopyTransport:
+    """Eager P2P copy CUDA IPC transport."""
+
+    def __init__(self, config: GPUTransportConfig):
+        self._config = config
+        self._registry = TensorRegistry(timeout_ms=config.release_timeout_ms)
+        self._ipc_args_store: dict[str, tuple] = {}
+        self._copy_streams: dict[str, torch.cuda.Stream] = {}
+        if config.enable_peer_access:
+            self._ensure_peer_access(config.src_device, config.dst_device)
+
+    @staticmethod
+    def _ensure_peer_access(src: int, dst: int) -> None:
+        for i in (src, dst):
+            for j in (src, dst):
+                if i != j and not torch.cuda.can_device_access_peer(i, j):
+                    try:
+                        torch.cuda.device(i).enable_peer_access(j)
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to enable P2P access device %d -> %d: %s", i, j, e)
+
+    def _get_copy_stream(self, device: str) -> torch.cuda.Stream:
+        if device not in self._copy_streams:
+            self._copy_streams[device] = torch.cuda.Stream(
+                device=torch.device(device))
+        return self._copy_streams[device]
+
+    def send(
+        self,
+        tensor: torch.Tensor,
+        *,
+        dst_rank: int,
+        tensor_id: str | None = None,
+    ) -> TransportHandle:
+        if not tensor.is_cuda:
+            raise ValueError(f"Only CUDA tensors supported, got device={tensor.device}")
+        if not tensor.is_contiguous():
+            logger.warning("send: non-contiguous tensor %s, calling .contiguous()", tensor_id)
+            tensor = tensor.contiguous()
+
+        tid = tensor_id or uuid.uuid4().hex[:12]
+        t0 = time.perf_counter()
+        torch.cuda.current_stream(tensor.device).synchronize()
+        t1 = time.perf_counter()
+
+        ipc_args = extract_ipc_args(tensor)
+        t2 = time.perf_counter()
+
+        metadata = TensorMetadata.from_tensor(
+            tensor,
+            tensor_id=tid,
+            mode="cuda_copy",
+            src_device=str(tensor.device),
+            dst_device=f"cuda:{self._config.dst_device}",
+        )
+        metadata.send_start_ts = t0
+        metadata.ipc_meta_ready_ts = t2
+
+        metadata.ipc_args = ipc_args
+
+        self._registry.register(tid, tensor)
+        self._ipc_args_store[tid] = ipc_args
+
+        logger.debug(
+            "send: id=%s shape=%s dtype=%s nbytes=%d sync_ms=%.3f ipc_ms=%.3f",
+            tid, metadata.shape, metadata.dtype, metadata.nbytes,
+            (t1 - t0) * 1000, (t2 - t1) * 1000,
+        )
+        return TransportHandle(tensor_id=tid, metadata=metadata)
+
+    def recv(
+        self,
+        handle: TransportHandle,
+        *,
+        src_rank: int,
+        dst_device: torch.device | str,
+    ) -> torch.Tensor:
+        meta = handle.metadata
+        if meta.mode != "cuda_copy":
+            raise ValueError(f"Expected mode=cuda_copy, got {meta.mode}")
+
+        ipc_args = meta.ipc_args
+        if ipc_args is None:
+            raise ValueError("TransportHandle has no IPC args")
+
+        dst_dev = torch.device(dst_device) if isinstance(dst_device, str) else dst_device
+
+        # Check P2P capability
+        if not torch.cuda.can_device_access_peer(self._config.src_device, dst_dev.index):
+            raise RuntimeError(
+                f"P2P access not available from device {self._config.src_device} "
+                f"to {dst_dev}. Enable peer access or use cuda_ipc mode instead."
+            )
+
+        t0 = time.perf_counter()
+        # 1. Open IPC allocation (zero-copy view of producer memory)
+        with torch.cuda.device(dst_dev):
+            src_tensor = rebuild_from_ipc_args(ipc_args)
+        t1 = time.perf_counter()
+
+        # 2. Allocate local tensor on dst_device
+        torch_dtype = getattr(torch, meta.dtype.replace("torch.", ""))
+        local_tensor = torch.empty(meta.shape, dtype=torch_dtype, device=dst_dev)
+        t2 = time.perf_counter()
+
+        # 3. Async P2P copy on dedicated stream, then synchronize
+        copy_stream = self._get_copy_stream(str(dst_dev))
+        with torch.cuda.stream(copy_stream):
+            local_tensor.copy_(src_tensor, non_blocking=True)
+            copy_event = torch.cuda.Event()
+            copy_event.record(copy_stream)
+        copy_event.synchronize()
+        t3 = time.perf_counter()
+
+        logger.debug(
+            "recv: id=%s shape=%s open_ms=%.3f alloc_ms=%.3f copy_ms=%.3f",
+            meta.tensor_id, meta.shape,
+            (t1 - t0) * 1000, (t2 - t1) * 1000, (t3 - t2) * 1000,
+        )
+        return local_tensor
+
+    def release(self, tensor_id: str) -> None:
+        self._ipc_args_store.pop(tensor_id, None)
+        self._registry.release(tensor_id)
+
+    def close(self) -> None:
+        self._ipc_args_store.clear()
+        self._registry.clear()
+        for s in self._copy_streams.values():
+            try:
+                s.synchronize()
+            except Exception:
+                pass
+        self._copy_streams.clear()
+
+    def cleanup_timeouts(self) -> list[str]:
+        return self._registry.cleanup_timeouts()
+
+    @property
+    def registry_size(self) -> int:
+        return self._registry.size
