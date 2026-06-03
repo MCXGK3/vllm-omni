@@ -110,24 +110,53 @@ class UniIPCConnector(OmniConnectorBase):
         )
         self._transport = create_transport(transport_config)
 
+    @staticmethod
+    def _has_gpu(obj: Any) -> bool:
+        """Return True if *obj* contains any CUDA tensors (inline, no imports)."""
+        import torch
+        if isinstance(obj, torch.Tensor) and obj.is_cuda:
+            return True
+        if isinstance(obj, dict):
+            return any(UniIPCConnector._has_gpu(v) for v in obj.values())
+        if isinstance(obj, (list, tuple)):
+            return any(UniIPCConnector._has_gpu(v) for v in obj)
+        return False
+
     def _split(self, obj: Any) -> Any:
         """Replace GPU tensors with ``__gpux__`` markers using the transport."""
+        if not self._has_gpu(obj):
+            return obj
         self._init_transport()
         from vllm_omni.distributed.gpu_transport.split import (
-            split_gpu_tensors, has_gpu_tensors)
-        if has_gpu_tensors(obj):
-            obj = split_gpu_tensors(obj, self._transport)
-            self._metrics["gpu_tensors_sent"] += 1
+            split_gpu_tensors)
+        obj = split_gpu_tensors(obj, self._transport)
+        self._metrics["gpu_tensors_sent"] += 1
         return obj
 
     def _reassemble(self, obj: Any) -> Any:
         """Replace ``__gpux__`` markers with real GPU tensors."""
+        if not isinstance(obj, dict):
+            return obj
+        # Check for __gpux__ markers without importing from split
+        if not self._has_markers(obj):
+            return obj
         self._init_transport()
         from vllm_omni.distributed.gpu_transport.split import (
             reassemble_gpu_tensors)
         obj = reassemble_gpu_tensors(obj, self._transport)
         self._metrics["gpu_tensors_recv"] += 1
         return obj
+
+    @staticmethod
+    def _has_markers(obj: Any) -> bool:
+        """Return True if *obj* contains any ``__gpux__`` markers."""
+        if isinstance(obj, dict):
+            if obj.get("__gpux__"):
+                return True
+            return any(UniIPCConnector._has_markers(v) for v in obj.values())
+        if isinstance(obj, (list, tuple)):
+            return any(UniIPCConnector._has_markers(v) for v in obj)
+        return False
 
     # ------------------------------------------------------------------
     # OmniConnectorBase interface
