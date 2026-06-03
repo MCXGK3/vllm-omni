@@ -61,7 +61,8 @@ class CudaCopyTransport:
     ) -> TransportHandle:
         if not tensor.is_cuda:
             raise ValueError(f"Only CUDA tensors supported, got device={tensor.device}")
-        if not tensor.is_contiguous():
+        _was_contiguous = tensor.is_contiguous()
+        if not _was_contiguous:
             logger.warning("send: non-contiguous tensor %s, calling .contiguous()", tensor_id)
             tensor = tensor.contiguous()
 
@@ -80,6 +81,7 @@ class CudaCopyTransport:
             src_device=str(tensor.device),
             dst_device=f"cuda:{self._config.dst_device}",
         )
+        metadata.contiguous = _was_contiguous
         metadata.send_start_ts = t0
         metadata.ipc_meta_ready_ts = t2
 
