@@ -3,7 +3,14 @@
 
 Producer (GPU 0) creates tensors, sends via CUDA IPC or CUDA copy.
 Consumer (GPU 1) receives, optionally sleeps to simulate queue delay,
-performs minimal access, then signals release.
+performs **full-tensor access** (tensor.sum() on all elements) to measure
+true remote-memory cost for cuda_ipc, then signals release.
+
+Key metric:
+  recv_latency_ms   — time to get a usable tensor handle (IPC open or P2P copy)
+  access_latency_ms — time to compute .sum() on the **entire** tensor
+  cuda_ipc:  recv is fast (handle only), access is slow (remote VRAM bandwidth)
+  cuda_copy: recv is slow (full P2P copy), access is fast (local memory)
 
 Usage:
   python benchmarks/gpu_transport/run_benchmark.py \\
@@ -225,7 +232,10 @@ def consumer_worker(conn, mode, src_dev, dst_dev,
                 time.sleep(queue_delay_ms / 1000.0)
 
             t2 = time.perf_counter()
-            _ = tensor[:10].sum().item()
+            # Full-tensor access: touches every element to measure true cost.
+            # For cuda_ipc this exercises remote GPU memory bandwidth across
+            # PCIe/NVLink.  For cuda_copy this is fast local access.
+            _ = tensor.sum().item()
             torch.cuda.synchronize(tensor.device)
             t3 = time.perf_counter()
             access_ms = (t3 - t2) * 1000
@@ -254,7 +264,7 @@ def run_benchmark_config(nbytes, mode, src, dst, delay_ms,
 
     Returns:
         List of dicts with keys ``send_ms``, ``recv_ms``,
-        ``consumer_access_ms``, ``total_hold_ms`` for the
+        ``access_latency_ms``, ``total_hold_ms`` for the
         non-warmup iterations.  May be shorter than *iterations*
         if the processes crashed or timed out.
     """
@@ -302,7 +312,7 @@ def run_benchmark_config(nbytes, mode, src, dst, delay_ms,
 
 FIELD_NAMES = [
     "mode", "tensor_size_mb", "queue_delay_ms", "iteration",
-    "metadata_latency_ms", "recv_latency_ms", "consumer_access_ms",
+    "metadata_latency_ms", "recv_latency_ms", "access_latency_ms",
     "end_to_end_ms", "total_hold_ms", "success", "error",
 ]
 
@@ -337,7 +347,7 @@ def print_aggregate(path: str) -> None:
 
     print("\n--- Aggregate Summary ---")
     for metric in ["end_to_end_ms", "metadata_latency_ms", "recv_latency_ms",
-                   "consumer_access_ms", "total_hold_ms"]:
+                   "access_latency_ms", "total_hold_ms"]:
         stats = _aggregate_stats(rows, metric)
         if stats is None:
             continue
@@ -418,7 +428,7 @@ def main():
                                 f"{metrics['send_ms']:.3f}",
                             "recv_latency_ms":
                                 f"{metrics['recv_ms']:.3f}",
-                            "consumer_access_ms":
+                            "access_latency_ms":
                                 f"{metrics['consumer_access_ms']:.3f}",
                             "end_to_end_ms": f"{e2e:.3f}",
                             "total_hold_ms":
@@ -436,7 +446,7 @@ def main():
                             "iteration": it,
                             "metadata_latency_ms": "",
                             "recv_latency_ms": "",
-                            "consumer_access_ms": "",
+                            "access_latency_ms": "",
                             "end_to_end_ms": "",
                             "total_hold_ms": "",
                             "success": "0",
@@ -452,7 +462,7 @@ def main():
                             "iteration": it,
                             "metadata_latency_ms": "",
                             "recv_latency_ms": "",
-                            "consumer_access_ms": "",
+                            "access_latency_ms": "",
                             "end_to_end_ms": "",
                             "total_hold_ms": "",
                             "success": "0",
