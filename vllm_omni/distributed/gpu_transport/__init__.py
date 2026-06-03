@@ -5,6 +5,7 @@ from .config import GPUTransportConfig, TransportMode
 from .logging import get_logger
 from .cuda_ipc_transport import CudaIpcTransport
 from .cuda_copy_transport import CudaCopyTransport
+from .split import split_gpu_tensors, reassemble_gpu_tensors, has_gpu_tensors
 
 
 def create_transport(config: GPUTransportConfig):
@@ -20,4 +21,5 @@ __all__ = [
     "GPUTensorTransport", "TensorMetadata", "TransportHandle",
     "GPUTransportConfig", "TransportMode", "get_logger",
     "CudaIpcTransport", "CudaCopyTransport", "create_transport",
+    "split_gpu_tensors", "reassemble_gpu_tensors", "has_gpu_tensors",
 ]
