@@ -9,8 +9,10 @@ Producer retains the tensor until consumer sends release ACK.
 """
 from __future__ import annotations
 
+import threading
 import time
 import uuid
+from multiprocessing.connection import Connection
 
 import torch
 
@@ -32,6 +34,15 @@ class CudaIpcTransport:
         self._ipc_args_store: dict[str, tuple] = {}
         if config.enable_peer_access:
             self._ensure_peer_access(config.src_device, config.dst_device)
+
+        # ACK thread support (optional -- only when ack_conn is provided)
+        self._ack_conn: Connection | None = getattr(config, 'ack_conn', None)
+        self._ack_thread: threading.Thread | None = None
+        self._ack_running = False
+        if self._ack_conn is not None:
+            self._ack_running = True
+            self._ack_thread = threading.Thread(target=self._ack_loop, daemon=True)
+            self._ack_thread.start()
 
     @staticmethod
     def _ensure_peer_access(src: int, dst: int) -> None:
@@ -118,11 +129,33 @@ class CudaIpcTransport:
         )
         return tensor
 
+    def _ack_loop(self) -> None:
+        """Background daemon thread: poll ACK pipe and auto-release tensors."""
+        from .control_channel import ProducerControl
+        ctrl = ProducerControl(self._ack_conn)
+        while self._ack_running:
+            msg = ctrl.recv_ack(timeout_ms=500.0)
+            if msg is None:
+                continue
+            if msg.get("type") == "shutdown":
+                break
+            tensor_id = msg.get("tensor_id", "")
+            if tensor_id:
+                logger.debug("ack_thread: releasing id=%s", tensor_id)
+                self.release(tensor_id)
+
+    def shutdown_ack_thread(self) -> None:
+        """Signal the ACK thread to stop (does not join)."""
+        self._ack_running = False
+
     def release(self, tensor_id: str) -> None:
         self._ipc_args_store.pop(tensor_id, None)
         self._registry.release(tensor_id)
 
     def close(self) -> None:
+        self.shutdown_ack_thread()
+        if self._ack_thread is not None and self._ack_thread.is_alive():
+            self._ack_thread.join(timeout=2.0)
         self._ipc_args_store.clear()
         self._registry.clear()
 
