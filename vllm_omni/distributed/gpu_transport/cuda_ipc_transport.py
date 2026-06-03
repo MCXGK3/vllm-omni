@@ -134,7 +134,11 @@ class CudaIpcTransport:
         from .control_channel import ProducerControl
         ctrl = ProducerControl(self._ack_conn)
         while self._ack_running:
-            msg = ctrl.recv_ack(timeout_ms=500.0)
+            try:
+                msg = ctrl.recv_ack(timeout_ms=500.0)
+            except Exception:
+                logger.exception("ack_thread: unexpected error in recv_ack")
+                continue
             if msg is None:
                 continue
             if msg.get("type") == "shutdown":
@@ -150,6 +154,10 @@ class CudaIpcTransport:
 
     def release(self, tensor_id: str) -> None:
         self._ipc_args_store.pop(tensor_id, None)
+        # Note: self._registry.release() is thread-safe (uses threading.Lock inside TensorRegistry).
+        # The _ipc_args_store.pop() above is safe because dict.pop() is atomic at the Python
+        # interpreter level (single opcode).  If concurrent access becomes an issue, extract
+        # _ipc_args_store into TensorRegistry.
         self._registry.release(tensor_id)
 
     def close(self) -> None:

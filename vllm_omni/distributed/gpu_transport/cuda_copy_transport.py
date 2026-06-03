@@ -164,7 +164,11 @@ class CudaCopyTransport:
         from .control_channel import ProducerControl
         ctrl = ProducerControl(self._ack_conn)
         while self._ack_running:
-            msg = ctrl.recv_ack(timeout_ms=500.0)
+            try:
+                msg = ctrl.recv_ack(timeout_ms=500.0)
+            except Exception:
+                logger.exception("ack_thread: unexpected error in recv_ack")
+                continue
             if msg is None:
                 continue
             if msg.get("type") == "shutdown":
