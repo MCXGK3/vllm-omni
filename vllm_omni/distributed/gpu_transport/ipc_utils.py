@@ -29,6 +29,11 @@ def extract_ipc_args(tensor: torch.Tensor) -> tuple:
 
     The tensor's CUDA stream must be synchronized before calling this.
     """
+    if not tensor.is_cuda:
+        raise ValueError(
+            f"extract_ipc_args requires a CUDA tensor, got device={tensor.device}"
+        )
+
     from torch.multiprocessing.reductions import reduce_tensor
 
     _, args = reduce_tensor(tensor)
@@ -39,7 +44,6 @@ def extract_ipc_args(tensor: torch.Tensor) -> tuple:
 
 def rebuild_from_ipc_args(
     ipc_args: tuple,
-    src_device: str = "cuda:0",
 ) -> torch.Tensor:
     """Reconstruct a tensor from IPC args (zero-copy view of sender's memory).
 
