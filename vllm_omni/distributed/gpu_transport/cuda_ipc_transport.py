@@ -39,10 +39,7 @@ class CudaIpcTransport:
         self._ack_conn: Connection | None = getattr(config, 'ack_conn', None)
         self._ack_thread: threading.Thread | None = None
         self._ack_running = False
-        if self._ack_conn is not None:
-            self._ack_running = True
-            self._ack_thread = threading.Thread(target=self._ack_loop, daemon=True)
-            self._ack_thread.start()
+        self._start_ack_thread()
 
     @staticmethod
     def _ensure_peer_access(src: int, dst: int) -> None:
@@ -54,6 +51,13 @@ class CudaIpcTransport:
                     except Exception as e:
                         logger.warning(
                             "Failed to enable P2P access device %d -> %d: %s", i, j, e)
+
+    def _start_ack_thread(self) -> None:
+        """Start the ACK thread if ack_conn is set. Idempotent."""
+        if self._ack_conn is not None and not self._ack_running:
+            self._ack_running = True
+            self._ack_thread = threading.Thread(target=self._ack_loop, daemon=True)
+            self._ack_thread.start()
 
     def send(
         self,
