@@ -136,12 +136,13 @@ class UniIPCConnector(OmniConnectorBase):
         """
         import torch
 
+        nbytes = tensor.numel() * tensor.element_size()
+
         # Dimension 1: mode "none" always inlines
         if self._transport_mode == "none":
             self._metrics["gpu_tensors_inlined"] += 1
+            self._metrics["inline_bytes"] += nbytes
             return "inline"
-
-        nbytes = tensor.numel() * tensor.element_size()
 
         # Dimension 2: size threshold
         if nbytes < self._gpu_transport_min_bytes:
