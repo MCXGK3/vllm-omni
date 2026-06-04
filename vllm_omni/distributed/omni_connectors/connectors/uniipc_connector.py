@@ -58,6 +58,9 @@ class UniIPCConnector(OmniConnectorBase):
         self._gpu_memory_pressure_threshold: float = float(
             config.get("gpu_memory_pressure_threshold", 0.0))
 
+        # Consumer-side ACK connection for GPU tensor release notifications
+        self._consumer_ack_conn: Any = config.get("consumer_ack_conn", None)
+
         self._metrics: dict[str, int] = {
             "puts": 0,
             "gets": 0,
@@ -139,6 +142,7 @@ class UniIPCConnector(OmniConnectorBase):
             src_device=self._src_device,
             dst_device=self._dst_device,
             release_timeout_ms=self._release_timeout_ms,
+            consumer_ack_conn=self._consumer_ack_conn,
         )
         self._transport = create_transport(transport_config)
 
@@ -315,6 +319,16 @@ class UniIPCConnector(OmniConnectorBase):
                             "Failed to release GPU tensor %s for key %s",
                             tid, key, exc_info=True,
                         )
+
+    def notify_gpu_tensor_consumed(self, tensor_id: str) -> None:
+        """Notify producer that a GPU tensor (cuda_ipc mode) is no longer needed.
+
+        Only meaningful for cuda_ipc mode where the consumer holds a zero-copy
+        view of the producer's GPU memory.  For cuda_copy mode the ACK is sent
+        automatically in recv().
+        """
+        if self._transport is not None and hasattr(self._transport, 'notify_consumed'):
+            self._transport.notify_consumed(tensor_id)
 
     def cleanup(self, request_id: str) -> None:
         """Clean SHM segments and release transport-held tensors."""
