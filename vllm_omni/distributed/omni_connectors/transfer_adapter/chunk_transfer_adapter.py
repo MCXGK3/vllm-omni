@@ -289,6 +289,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         Idempotent: calling with an already-cleaned or unknown id is safe.
         """
+        # Look up the external request ID before popping the mapping.
+        # The connector's tensor tracking uses external IDs in put_key.
+        external_req_id = self.request_ids_mapping.get(request_id, request_id)
+
         self.finished_requests.discard(request_id)
         self.get_req_chunk.pop(request_id, None)
         self.requests_with_ready_chunks.discard(request_id)
@@ -301,7 +305,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # Release GPU transport tensors now that the consumer (talker)
         # is truly done processing this request's data.
         if hasattr(self.connector, "release_gpu_tensors"):
-            self.connector.release_gpu_tensors(request_id)
+            self.connector.release_gpu_tensors(external_req_id)
 
     def cleanup_sender(self, external_req_id: str) -> None:
         """Reclaim sender-side per-request state (keyed by external id).
