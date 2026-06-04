@@ -83,6 +83,86 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
         self._downstream_payload_cache: dict[str, bool] = {}
+        # GPU transport for IPC export (thinker->talker hidden states)
+        self._gpu_transport: Any = None
+
+    def _get_or_create_gpu_transport(self) -> Any:
+        """Lazy-init CUDA IPC transport for hidden state sharing.
+
+        Created in the engine process so GPU tensors can be exported
+        via CUDA IPC instead of being serialized to CPU.
+        """
+        if self._gpu_transport is not None:
+            return self._gpu_transport
+
+        import importlib.util, os, sys
+
+        gpu_base = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "distributed", "gpu_transport",
+        )
+
+        def _load(name, fname):
+            full = f"vllm_omni.distributed.gpu_transport.{name}"
+            if full in sys.modules:
+                return sys.modules[full]
+            path = os.path.join(gpu_base, fname)
+            spec = importlib.util.spec_from_file_location(full, path)
+            mod = importlib.util.module_from_spec(spec)
+            mod.__package__ = "vllm_omni.distributed.gpu_transport"
+            sys.modules[full] = mod
+            spec.loader.exec_module(mod)
+            return mod
+
+        _load("config", "config.py")
+        _load("logging", "logging.py")
+        _load("protocol", "protocol.py")
+        _load("tensor_registry", "tensor_registry.py")
+        _load("ipc_utils", "ipc_utils.py")
+        _load("cuda_ipc_transport", "cuda_ipc_transport.py")
+        _load("cuda_copy_transport", "cuda_copy_transport.py")
+
+        # Load the package itself
+        pkg_name = "vllm_omni.distributed.gpu_transport"
+        pkg_path = os.path.join(gpu_base, "__init__.py")
+        if os.path.isfile(pkg_path):
+            spec = importlib.util.spec_from_file_location(pkg_name, pkg_path)
+            pkg_mod = importlib.util.module_from_spec(spec)
+            pkg_mod.__package__ = pkg_name
+            pkg_mod.__path__ = [gpu_base]
+            sys.modules[pkg_name] = pkg_mod
+            spec.loader.exec_module(pkg_mod)
+
+        from vllm_omni.distributed.gpu_transport.config import GPUTransportConfig
+        from vllm_omni.distributed.gpu_transport import create_transport
+
+        # Use src=3 (thinker GPU), dst=7 (talker GPU) as defaults
+        # These match qwen3_omni_moe.yaml config
+        cfg = GPUTransportConfig(
+            mode="cuda_ipc",
+            src_device=3,
+            dst_device=7,
+            release_timeout_ms=300_000.0,  # 5 min timeout for talker processing
+        )
+        self._gpu_transport = create_transport(cfg)
+        return self._gpu_transport
+
+    def _export_hidden_to_ipc(self, tensor: torch.Tensor) -> dict:
+        """Export a GPU hidden state tensor via CUDA IPC.
+
+        Returns a serializable dict with IPC args that can be
+        reconstructed on the consumer side via rebuild_from_ipc_args().
+        """
+        transport = self._get_or_create_gpu_transport()
+        handle = transport.send(tensor, dst_rank=transport._config.dst_device)
+        ipc_args = transport._ipc_args_store[handle.tensor_id]
+        import pickle
+        return {
+            "__gpux__": True,
+            "tensor_id": handle.tensor_id,
+            "ipc_args": pickle.dumps(ipc_args),
+            "meta": handle.metadata.to_dict(),
+        }
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -925,7 +1005,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 int(hidden_states.shape[0]),
             )
             if len(downstream_req_ids) == len(req_ids_output_copy):
-                hidden_states_cpu = hidden_states[:num_valid_tokens].detach().to("cpu").contiguous()
+                _hs = hidden_states[:num_valid_tokens].detach()
+                try:
+                    hidden_states_cpu = self._export_hidden_to_ipc(_hs)
+                except Exception:
+                    logger.warning("IPC export failed for hidden_states_cpu, falling back to CPU", exc_info=True)
+                    hidden_states_cpu = _hs.to("cpu").contiguous()
             else:
                 req_hidden_states_cpu = {}
         num_scheduled_tokens_np = getattr(self, "_omni_num_scheduled_tokens_np", None)
@@ -970,7 +1055,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     start = int(query_start_loc_cpu[idx])
                     sched = int(num_scheduled_tokens_np[idx])
                     end = start + sched
-                    req_hidden_states_cpu[rid] = hidden_states[start:end].detach().to("cpu").contiguous()
+                    _hs = hidden_states[start:end].detach()
+                    try:
+                        req_hidden_states_cpu[rid] = self._export_hidden_to_ipc(_hs)
+                    except Exception:
+                        logger.warning("IPC export failed for req %s, falling back to CPU", rid, exc_info=True)
+                        req_hidden_states_cpu[rid] = _hs.to("cpu").contiguous()
 
             pooler_output = []
             for rid in req_ids_output_copy:
