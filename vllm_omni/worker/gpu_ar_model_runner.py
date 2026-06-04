@@ -1006,7 +1006,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 int(hidden_states.shape[0]),
             )
             if len(downstream_req_ids) == len(req_ids_output_copy):
-                _hs = hidden_states[:num_valid_tokens].detach()
+                _hs = hidden_states[:num_valid_tokens].detach().clone()
                 try:
                     hidden_states_cpu = self._export_hidden_to_ipc(_hs)
                 except Exception:
@@ -1056,7 +1056,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     start = int(query_start_loc_cpu[idx])
                     sched = int(num_scheduled_tokens_np[idx])
                     end = start + sched
-                    _hs = hidden_states[start:end].detach()
+                    _hs = hidden_states[start:end].detach().clone()
                     try:
                         req_hidden_states_cpu[rid] = self._export_hidden_to_ipc(_hs)
                     except Exception:
