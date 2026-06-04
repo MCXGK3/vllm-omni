@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
+import time
 from collections import defaultdict, deque
 from typing import Any
 
@@ -135,11 +136,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         # Use timeout=0 for non-blocking poll
         try:
+            t0 = time.perf_counter()
             result = self.connector.get(
                 str(target_stage_id),
                 str(stage_id),
                 connector_get_key,
             )
+            get_ms = (time.perf_counter() - t0) * 1000.0
         except Exception as e:
             logger.error(f"SharedMemoryConnector get failed for req {connector_get_key}: {e}")
             return False
@@ -147,6 +150,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if result is None:
             return False
         payload_data, size = result
+
+        logger.info(
+            "TIMING get stage=%s->%s req=%s chunk=%s size=%d get_ms=%.2f",
+            target_stage_id, stage_id, external_req_id, chunk_id, size, get_ms,
+        )
 
         if payload_data:
             # Update connector state
@@ -248,16 +256,22 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if not payload_data:
             return
 
+        t0 = time.perf_counter()
         success, size, metadata = self.connector.put(
             from_stage=str(stage_id),
             to_stage=str(next_stage_id),
             put_key=connector_put_key,
             data=payload_data,
         )
+        put_ms = (time.perf_counter() - t0) * 1000.0
 
         if success:
             self.put_req_chunk[external_req_id] += 1
             logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
+            logger.info(
+                "TIMING put stage=%s->%s req=%s chunk=%s size=%d put_ms=%.2f",
+                stage_id, next_stage_id, external_req_id, chunk_id, size, put_ms,
+            )
             finished_flag = payload_data.get("meta", {}).get("finished", payload_data.get("finished"))
             is_payload_finished = False
             if isinstance(finished_flag, torch.Tensor):

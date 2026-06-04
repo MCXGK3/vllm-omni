@@ -62,7 +62,7 @@ class UniIPCConnector(OmniConnectorBase):
         self._ack_conn: Any = config.get("ack_conn", None)  # producer side: receive ACKs
         self._consumer_ack_conn: Any = config.get("consumer_ack_conn", None)  # consumer side: send ACKs
 
-        self._metrics: dict[str, int] = {
+        self._metrics: dict[str, Any] = {
             "puts": 0,
             "gets": 0,
             "bytes_transferred": 0,
@@ -71,6 +71,8 @@ class UniIPCConnector(OmniConnectorBase):
             "gpu_tensors_inlined": 0,
             "inline_bytes": 0,
             "pressure_fallbacks": 0,
+            "put_total_ms": 0.0,
+            "get_total_ms": 0.0,
         }
 
         # Track GPU transport tensor_ids by put_key for per-request ACK.
@@ -271,6 +273,7 @@ class UniIPCConnector(OmniConnectorBase):
         data: Any,
     ) -> tuple[bool, int, dict[str, Any] | None]:
         """Split GPU tensors, delegate metadata to SHM connector."""
+        t0 = time.perf_counter()
         try:
             stripped = self._split(data)
             # Track GPU transport tensor_ids for per-request ACK
@@ -283,6 +286,7 @@ class UniIPCConnector(OmniConnectorBase):
                 return False, 0, None
             self._metrics["puts"] += 1
             self._metrics["bytes_transferred"] += size
+            self._metrics["put_total_ms"] += (time.perf_counter() - t0) * 1000.0
             return True, size, metadata
         except Exception:
             logger.exception("UniIPC put failed for key=%s", put_key)
@@ -296,6 +300,7 @@ class UniIPCConnector(OmniConnectorBase):
         metadata: dict[str, Any] | None = None,
     ) -> tuple[Any, int] | None:
         """Retrieve via SHM connector, then reassemble GPU tensors."""
+        t0 = time.perf_counter()
         try:
             result = self._shm.get(from_stage, to_stage, get_key, metadata)
             if result is None:
@@ -303,6 +308,7 @@ class UniIPCConnector(OmniConnectorBase):
             obj, size = result
             obj = self._reassemble(obj)
             self._metrics["gets"] += 1
+            self._metrics["get_total_ms"] += (time.perf_counter() - t0) * 1000.0
             return obj, size
         except Exception:
             logger.exception("UniIPC get failed for key=%s", get_key)
