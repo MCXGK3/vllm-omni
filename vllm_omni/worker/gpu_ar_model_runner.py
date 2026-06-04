@@ -1039,6 +1039,21 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
         return async_output
 
+    def shutdown(self) -> None:
+        """Override to drain pending CUDA errors before vLLM's shutdown.
+
+        Under heavy load a ``device-side assert`` may be triggered
+        asynchronously by a CUDA kernel.  If left undrained the error
+        surfaces inside ``GPUModelRunner._cleanup_profiling_kv_cache``
+        during ``torch.accelerator.synchronize()``, leaking GPU memory.
+        """
+        import torch
+        try:
+            torch.cuda.synchronize()
+        except RuntimeError:
+            logger.warning("Pending CUDA error drained during shutdown", exc_info=True)
+        super().shutdown()
+
     def _resolve_global_request_id(self, req_id: str) -> str:
         """Resolve global request ID from request state."""
         req_state = self.requests.get(req_id)
