@@ -314,19 +314,19 @@ def thinker2talker_async_chunk(
         prompt_token_ids = _ensure_list(prompt_token_ids)
         payload: OmniPayload = {
             "embed": {
-                "prefill": thinker_emb.detach().cpu(),
+                "prefill": thinker_emb.detach(),
                 # Provide thinker-side TTS token embeddings for talker projection
-                "tts_bos": thinker_embed.get("tts_bos").detach().cpu()
+                "tts_bos": thinker_embed.get("tts_bos").detach()
                 if isinstance(thinker_embed.get("tts_bos"), torch.Tensor)
                 else None,
-                "tts_eos": thinker_embed.get("tts_eos").detach().cpu()
+                "tts_eos": thinker_embed.get("tts_eos").detach()
                 if isinstance(thinker_embed.get("tts_eos"), torch.Tensor)
                 else None,
-                "tts_pad": thinker_embed.get("tts_pad").detach().cpu()
+                "tts_pad": thinker_embed.get("tts_pad").detach()
                 if isinstance(thinker_embed.get("tts_pad"), torch.Tensor)
                 else None,
             },
-            "hidden_states": {"output": thinker_hid.detach().cpu()},
+            "hidden_states": {"output": thinker_hid.detach()},
             "ids": {"all": all_token_ids, "prompt": prompt_token_ids},
             "meta": {"finished": torch.tensor(is_finished, dtype=torch.bool)},
         }
@@ -374,12 +374,12 @@ def thinker2talker_async_chunk(
 
         if output_token_ids:
             talker_additional_info["meta"]["override_keys"] = [("embed", "decode"), ("ids", "output")]
-            talker_additional_info["embed"] = {"decode": thinker_emb.detach().cpu()}
+            talker_additional_info["embed"] = {"decode": thinker_emb.detach()}
             talker_additional_info["ids"] = {"output": output_token_ids}
         else:
             # When prefilling a chunked thinker, thinker_hidden_states needs to be updated.
-            talker_additional_info["embed"] = {"prefill": thinker_emb.detach().cpu()}
-            talker_additional_info["hidden_states"] = {"output": thinker_hid.detach().cpu()}
+            talker_additional_info["embed"] = {"prefill": thinker_emb.detach()}
+            talker_additional_info["hidden_states"] = {"output": thinker_hid.detach()}
     return talker_additional_info
 
 
