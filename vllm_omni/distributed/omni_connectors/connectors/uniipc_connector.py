@@ -309,23 +309,17 @@ class UniIPCConnector(OmniConnectorBase):
             return None
 
     def release_gpu_tensors(self, request_id: str) -> None:
-        """Release GPU transport tensors for *request_id* without touching SHM.
+        """Release GPU transport tensors for *request_id* via Pipe ACK.
 
-        Called from the sender side when a request is finished.  SHM
-        segments are managed separately by the receiver side.
+        Sends a ``notify_consumed`` ACK through the consumer→producer
+        Pipe for each tracked tensor.  The producer's ACK thread handles
+        the actual TensorRegistry release.  SHM segments are untouched.
         """
         prefix = f"{request_id}_"
         keys = [k for k in list(self._pending_gpu_tensors) if k.startswith(prefix)]
         for key in keys:
             for tid in self._pending_gpu_tensors.pop(key, []):
-                if self._transport is not None:
-                    try:
-                        self._transport.release(tid)
-                    except Exception:
-                        logger.warning(
-                            "Failed to release GPU tensor %s for key %s",
-                            tid, key, exc_info=True,
-                        )
+                self.notify_gpu_tensor_consumed(tid)
 
     def notify_gpu_tensor_consumed(self, tensor_id: str) -> None:
         """Notify producer that a GPU tensor (cuda_ipc mode) is no longer needed.
