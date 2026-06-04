@@ -143,7 +143,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             src_device=3,
             dst_device=7,
             release_timeout_ms=300_000.0,  # 5 min timeout for talker processing
-            enable_peer_access=False,  # Workers may not see all GPUs
         )
         self._gpu_transport = create_transport(cfg)
         return self._gpu_transport
@@ -1006,7 +1005,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 int(hidden_states.shape[0]),
             )
             if len(downstream_req_ids) == len(req_ids_output_copy):
-                _hs = hidden_states[:num_valid_tokens].detach().clone()
+                _hs = hidden_states[:num_valid_tokens].detach()
                 try:
                     hidden_states_cpu = self._export_hidden_to_ipc(_hs)
                 except Exception:
@@ -1056,7 +1055,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     start = int(query_start_loc_cpu[idx])
                     sched = int(num_scheduled_tokens_np[idx])
                     end = start + sched
-                    _hs = hidden_states[start:end].detach().clone()
+                    _hs = hidden_states[start:end].detach()
                     try:
                         req_hidden_states_cpu[rid] = self._export_hidden_to_ipc(_hs)
                     except Exception:
