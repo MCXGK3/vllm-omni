@@ -143,6 +143,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             src_device=3,
             dst_device=7,
             release_timeout_ms=300_000.0,  # 5 min timeout for talker processing
+            enable_peer_access=False,  # Workers may not see all GPUs
         )
         self._gpu_transport = create_transport(cfg)
         return self._gpu_transport
