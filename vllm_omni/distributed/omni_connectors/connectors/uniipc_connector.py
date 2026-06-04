@@ -58,8 +58,9 @@ class UniIPCConnector(OmniConnectorBase):
         self._gpu_memory_pressure_threshold: float = float(
             config.get("gpu_memory_pressure_threshold", 0.0))
 
-        # Consumer-side ACK connection for GPU tensor release notifications
-        self._consumer_ack_conn: Any = config.get("consumer_ack_conn", None)
+        # ACK connections for GPU tensor release notifications
+        self._ack_conn: Any = config.get("ack_conn", None)  # producer side: receive ACKs
+        self._consumer_ack_conn: Any = config.get("consumer_ack_conn", None)  # consumer side: send ACKs
 
         self._metrics: dict[str, int] = {
             "puts": 0,
@@ -142,9 +143,15 @@ class UniIPCConnector(OmniConnectorBase):
             src_device=self._src_device,
             dst_device=self._dst_device,
             release_timeout_ms=self._release_timeout_ms,
+            ack_conn=self._ack_conn,
             consumer_ack_conn=self._consumer_ack_conn,
         )
         self._transport = create_transport(transport_config)
+
+        # Start ACK thread if transport supports it and ack_conn is wired
+        if self._transport is not None and self._ack_conn is not None:
+            if hasattr(self._transport, '_start_ack_thread'):
+                self._transport._start_ack_thread()
 
     def _route_tensor(self, tensor: "torch.Tensor") -> str:
         """Decide transport strategy for a single GPU tensor.
