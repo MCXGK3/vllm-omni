@@ -613,6 +613,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     )
                 except TypeError:
                     logits = self.model.compute_logits(sample_hidden_states)
+                except RuntimeError as e:
+                    if "device-side assert" in str(e) or "CUDA error" in str(e):
+                        logger.warning("CUDA error in compute_logits (post-completion step), skipping")
+                        logits = None
+                    else:
+                        raise
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -636,6 +642,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         )
                     except TypeError:
                         logits = self.model.compute_logits(sample_hidden_states)
+                    except RuntimeError as e:
+                        if "device-side assert" in str(e) or "CUDA error" in str(e):
+                            logger.warning("CUDA error in compute_logits (post-completion step), skipping")
+                            logits = None
+                        else:
+                            raise
 
                 model_output_broadcast_data: dict[str, Any] = {}
                 if logits is not None:
@@ -645,7 +657,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     model_output_broadcast_data, src=len(get_pp_group().ranks) - 1
                 )
                 assert broadcasted is not None
-                logits = broadcasted["logits"]
+                logits = broadcasted.get("logits")
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
