@@ -37,6 +37,7 @@ class CudaIpcTransport:
 
         # ACK thread support (optional -- only when ack_conn is provided)
         self._ack_conn: Connection | None = getattr(config, 'ack_conn', None)
+        self._consumer_ack_conn: Connection | None = getattr(config, 'consumer_ack_conn', None)
         self._ack_thread: threading.Thread | None = None
         self._ack_running = False
         self._start_ack_thread()
