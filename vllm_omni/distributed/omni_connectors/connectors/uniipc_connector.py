@@ -69,6 +69,10 @@ class UniIPCConnector(OmniConnectorBase):
             "pressure_fallbacks": 0,
         }
 
+        # Track GPU transport tensor_ids by put_key for per-request ACK.
+        # Key: put_key (e.g. "req-123_0_0"), Value: list of tensor_id strings.
+        self._pending_gpu_tensors: dict[str, list[str]] = {}
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -227,6 +231,21 @@ class UniIPCConnector(OmniConnectorBase):
             return any(UniIPCConnector._has_markers(v) for v in obj)
         return False
 
+    @staticmethod
+    def _collect_tensor_ids(obj: Any) -> list[str]:
+        """Walk *obj* and collect all tensor_ids from ``__gpux__`` markers."""
+        ids: list[str] = []
+        if isinstance(obj, dict):
+            if obj.get("__gpux__"):
+                ids.append(obj["tensor_id"])
+            else:
+                for v in obj.values():
+                    ids.extend(UniIPCConnector._collect_tensor_ids(v))
+        elif isinstance(obj, (list, tuple)):
+            for v in obj:
+                ids.extend(UniIPCConnector._collect_tensor_ids(v))
+        return ids
+
     # ------------------------------------------------------------------
     # OmniConnectorBase interface
     # ------------------------------------------------------------------
@@ -241,6 +260,10 @@ class UniIPCConnector(OmniConnectorBase):
         """Split GPU tensors, delegate metadata to SHM connector."""
         try:
             stripped = self._split(data)
+            # Track GPU transport tensor_ids for per-request ACK
+            tensor_ids = self._collect_tensor_ids(stripped)
+            if tensor_ids:
+                self._pending_gpu_tensors[put_key] = tensor_ids
             success, size, metadata = self._shm.put(
                 from_stage, to_stage, put_key, stripped)
             if not success:
@@ -275,6 +298,19 @@ class UniIPCConnector(OmniConnectorBase):
     def cleanup(self, request_id: str) -> None:
         """Clean SHM segments and release transport-held tensors."""
         self._shm.cleanup(request_id)
+        # Release GPU transport tensors for this request
+        if self._transport is not None:
+            prefix = f"{request_id}_"
+            keys = [k for k in list(self._pending_gpu_tensors) if k.startswith(prefix)]
+            for key in keys:
+                for tid in self._pending_gpu_tensors.pop(key, []):
+                    try:
+                        self._transport.release(tid)
+                    except Exception:
+                        logger.warning(
+                            "Failed to release GPU tensor %s for key %s",
+                            tid, key, exc_info=True,
+                        )
 
     def close(self) -> None:
         """Release SHM connector and GPU transport."""
