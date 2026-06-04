@@ -263,3 +263,40 @@ def test_cuda_copy_recv_sends_ack():
     producer.close()
     meta_prod.close()
     ack_prod.close()
+
+
+def test_cuda_ipc_notify_consumed_sends_ack():
+    """CudaIpcTransport.notify_consumed() sends release ACK."""
+    prod_conn, cons_conn = Pipe()
+
+    producer = CudaIpcTransport(GPUTransportConfig(
+        mode="cuda_ipc", src_device=0, dst_device=0,
+        ack_conn=prod_conn,
+    ))
+
+    consumer = CudaIpcTransport(GPUTransportConfig(
+        mode="cuda_ipc", src_device=0, dst_device=0,
+        consumer_ack_conn=cons_conn,
+    ))
+
+    tensor = torch.ones(4, device="cuda:0")
+    handle = producer.send(tensor, dst_rank=0)
+
+    # Consumer marks tensor as consumed
+    consumer.notify_consumed(handle.tensor_id)
+
+    # Producer receives ACK
+    ctrl = ProducerControl(prod_conn)
+    msg = ctrl.recv_ack(timeout_ms=1000.0)
+    assert msg is not None
+    assert msg.get("type") == "release"
+    assert msg.get("tensor_id") == handle.tensor_id
+
+    # After producer releases, tensor should be gone from registry
+    producer.release(handle.tensor_id)
+    assert producer.registry_size == 0
+
+    producer.close()
+    consumer.close()
+    prod_conn.close()
+    cons_conn.close()

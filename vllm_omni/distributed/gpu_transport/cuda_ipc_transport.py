@@ -157,6 +157,25 @@ class CudaIpcTransport:
         """Signal the ACK thread to stop (does not join)."""
         self._ack_running = False
 
+    def notify_consumed(self, tensor_id: str) -> None:
+        """Consumer calls this when done using a zero-copy tensor.
+
+        Sends a ``release`` ACK to the producer so it can free the tensor
+        from its TensorRegistry.  Safe to call multiple times (idempotent
+        on the producer side).
+        """
+        if self._consumer_ack_conn is None:
+            logger.debug("notify_consumed: no consumer_ack_conn set, skipping id=%s", tensor_id)
+            return
+        try:
+            from .control_channel import ConsumerControl
+            ctrl = ConsumerControl(self._consumer_ack_conn)
+            ctrl.send_ack(tensor_id, ack_type="release")
+            logger.debug("notify_consumed: sent release ACK for id=%s", tensor_id)
+        except Exception:
+            logger.warning("notify_consumed: failed to send ACK for id=%s",
+                           tensor_id, exc_info=True)
+
     def release(self, tensor_id: str) -> None:
         self._ipc_args_store.pop(tensor_id, None)
         # Note: self._registry.release() is thread-safe (uses threading.Lock inside TensorRegistry).
