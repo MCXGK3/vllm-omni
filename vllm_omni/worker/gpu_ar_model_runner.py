@@ -305,6 +305,21 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
+        # Drain any pending CUDA error from a prior engine step (e.g. a
+        # device-side assert triggered asynchronously after all requests
+        # completed).  Without this the error would kill the engine during
+        # shutdown and leak GPU memory.
+        try:
+            torch.cuda.synchronize()
+        except RuntimeError:
+            logger.warning("Pending CUDA error drained at execute_model start", exc_info=True)
+            self._cuda_error_drained = True
+        if getattr(self, "_cuda_error_drained", False):
+            # After a CUDA error the CUDA context may be in an unrecoverable
+            # state.  Return immediately so the engine loop stops scheduling
+            # further steps.
+            return None
+
         if not getattr(self, "_warmup_state_cleared", False):
             self._warmup_state_cleared = True
             if hasattr(self.model, "_clear_warmup_state"):
