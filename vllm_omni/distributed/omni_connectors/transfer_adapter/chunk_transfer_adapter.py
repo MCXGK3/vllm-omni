@@ -298,6 +298,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._cancelled_load_reqs.add(request_id)
         self._finished_load_reqs.discard(request_id)
 
+        # Release GPU transport tensors now that the consumer (talker)
+        # is truly done processing this request's data.
+        if hasattr(self.connector, "release_gpu_tensors"):
+            self.connector.release_gpu_tensors(request_id)
+
     def cleanup_sender(self, external_req_id: str) -> None:
         """Reclaim sender-side per-request state (keyed by external id).
 
@@ -314,11 +319,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if cached_ic is not None:
             cached_ic.pop(external_req_id, None)
 
-        # Release GPU transport tensors held for this request.
-        # Use release_gpu_tensors() (not cleanup()) — SHM segments are
-        # managed by the receiver side and must not be freed here.
-        if hasattr(self.connector, "release_gpu_tensors"):
-            self.connector.release_gpu_tensors(external_req_id)
 
     def cleanup(
         self,
