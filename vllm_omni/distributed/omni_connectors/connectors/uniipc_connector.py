@@ -237,7 +237,9 @@ class UniIPCConnector(OmniConnectorBase):
         ids: list[str] = []
         if isinstance(obj, dict):
             if obj.get("__gpux__"):
-                ids.append(obj["tensor_id"])
+                tid = obj.get("tensor_id")
+                if tid:
+                    ids.append(tid)
             else:
                 for v in obj.values():
                     ids.extend(UniIPCConnector._collect_tensor_ids(v))
@@ -298,12 +300,14 @@ class UniIPCConnector(OmniConnectorBase):
     def cleanup(self, request_id: str) -> None:
         """Clean SHM segments and release transport-held tensors."""
         self._shm.cleanup(request_id)
-        # Release GPU transport tensors for this request
-        if self._transport is not None:
-            prefix = f"{request_id}_"
-            keys = [k for k in list(self._pending_gpu_tensors) if k.startswith(prefix)]
-            for key in keys:
-                for tid in self._pending_gpu_tensors.pop(key, []):
+        # Release GPU transport tensors for this request.
+        # Always prune the tracking dict, even when transport is None
+        # (mode "none"), to avoid unbounded memory growth.
+        prefix = f"{request_id}_"
+        keys = [k for k in list(self._pending_gpu_tensors) if k.startswith(prefix)]
+        for key in keys:
+            for tid in self._pending_gpu_tensors.pop(key, []):
+                if self._transport is not None:
                     try:
                         self._transport.release(tid)
                     except Exception:
