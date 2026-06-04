@@ -65,7 +65,7 @@ def _recover_inline_tensor(marker: dict) -> torch.Tensor:
     in the marker metadata.
     """
     buf = io.BytesIO(marker["inline_data"])
-    tensor = torch.load(buf)
+    tensor = torch.load(buf, weights_only=True)
     dst_device = marker["meta"].get("dst_device", "cuda:0")
     return tensor.to(dst_device)
 

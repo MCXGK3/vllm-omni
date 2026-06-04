@@ -14,6 +14,12 @@
 async_chunk: true
 
 connectors:
+  uniipc_thinker_to_talker:
+    name: UniIPCConnector
+    extra:
+      gpu_transport_mode: cuda_ipc
+      src_device: 3
+      dst_device: 7
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
@@ -27,7 +33,7 @@ stages:
     gpu_memory_utilization: 0.80
     trust_remote_code: true
     enable_prefix_caching: false
-    devices: "0,1,2,3"
+    devices: "3,4,5,6"
     tensor_parallel_size: 4
     default_sampling_params:
       temperature: 0.4
@@ -43,9 +49,9 @@ stages:
     gpu_memory_utilization: 0.3
     trust_remote_code: true
     enable_prefix_caching: false
-    devices: "4"
+    devices: "7"
     input_connectors:
-      from_stage_0: connector_of_shared_memory
+      from_stage_0: uniipc_thinker_to_talker
     default_sampling_params:
       temperature: 0.9
       top_k: 50
@@ -61,7 +67,7 @@ stages:
     trust_remote_code: true
     enable_prefix_caching: false
     async_scheduling: false
-    devices: "5"
+    devices: "0"
     input_connectors:
       from_stage_1: connector_of_shared_memory
     default_sampling_params:
