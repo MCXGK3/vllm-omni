@@ -272,3 +272,123 @@ class TestUniIPCConnectorRouter:
         t = torch.ones(1000, device="cuda:0", dtype=torch.float32)
         assert connector._route_tensor(t) == "ipc"
         connector.close()
+
+
+class TestUniIPCConnectorInline:
+    """End-to-end tests for the inline path."""
+
+    def test_put_get_small_gpu_tensor_inlined(self):
+        """Small GPU tensor goes inline, roundtrips correctly."""
+        from vllm_omni.distributed.omni_connectors.connectors.uniipc_connector import (
+            UniIPCConnector,
+        )
+        import torch
+        connector = UniIPCConnector({
+            "stage_id": 0,
+            "device": "cuda:0",
+            "shm_threshold_bytes": 65536,
+            "gpu_transport_mode": "cuda_ipc",
+            "src_device": 0,
+            "dst_device": 1,
+            "gpu_transport_min_bytes": 10000,  # force inline for small tensor
+        })
+        t = torch.tensor([1.0, 2.0, 3.0], device="cuda:0")
+        data = {"tensor": t, "scalar": 42}
+
+        success, size, metadata = connector.put("0", "1", "test-inline", data)
+        assert success is True
+
+        result = connector.get("0", "1", "test-inline", metadata)
+        assert result is not None
+        obj, _ = result
+        assert "tensor" in obj
+        assert obj["scalar"] == 42
+        assert torch.allclose(obj["tensor"].cpu(), t.cpu())
+        assert connector._metrics["gpu_tensors_inlined"] >= 1
+
+        connector.cleanup("test-inline")
+        connector.close()
+
+    def test_put_get_mixed_inline_tensors(self):
+        """Multiple tensors in payload both go inline, roundtrip correctly."""
+        from vllm_omni.distributed.omni_connectors.connectors.uniipc_connector import (
+            UniIPCConnector,
+        )
+        import torch
+        connector = UniIPCConnector({
+            "stage_id": 0,
+            "device": "cuda:0",
+            "shm_threshold_bytes": 65536,
+            "gpu_transport_mode": "cuda_ipc",
+            "src_device": 0,
+            "dst_device": 1,
+            # threshold above both tensor sizes so both go inline
+            "gpu_transport_min_bytes": 1000,
+        })
+        t_small = torch.tensor([1.0], device="cuda:0")       # 4 bytes
+        t_large = torch.randn(100, device="cuda:0", dtype=torch.float32)  # 400 bytes
+        data = {"small": t_small, "large": t_large}
+
+        success, size, metadata = connector.put("0", "1", "test-mixed", data)
+        assert success is True
+
+        result = connector.get("0", "1", "test-mixed", metadata)
+        assert result is not None
+        obj, _ = result
+        assert torch.allclose(obj["small"].cpu(), t_small.cpu())
+        assert torch.allclose(obj["large"].cpu(), t_large.cpu())
+        assert connector._metrics["gpu_tensors_inlined"] >= 2
+
+        connector.cleanup("test-mixed")
+        connector.close()
+
+    def test_mode_none_puts_gpu_tensor_inline(self):
+        """Mode 'none' sends GPU tensors as inline bytes successfully."""
+        from vllm_omni.distributed.omni_connectors.connectors.uniipc_connector import (
+            UniIPCConnector,
+        )
+        import torch
+        connector = UniIPCConnector({
+            "stage_id": 0,
+            "device": "cuda:0",
+            "shm_threshold_bytes": 65536,
+            "gpu_transport_mode": "none",
+            "src_device": 0,
+            "dst_device": 1,
+        })
+        t = torch.randn(50, device="cuda:0")
+        data = {"tensor": t}
+
+        success, size, metadata = connector.put("0", "1", "test-none", data)
+        assert success is True
+
+        result = connector.get("0", "1", "test-none", metadata)
+        assert result is not None
+        obj, _ = result
+        assert torch.allclose(obj["tensor"].cpu(), t.cpu())
+
+        connector.cleanup("test-none")
+        connector.close()
+
+    def test_health_reports_new_metrics(self):
+        """health() includes new config and metric fields."""
+        from vllm_omni.distributed.omni_connectors.connectors.uniipc_connector import (
+            UniIPCConnector,
+        )
+        connector = UniIPCConnector({
+            "stage_id": 0,
+            "gpu_transport_mode": "cuda_ipc",
+            "src_device": 0,
+            "dst_device": 1,
+            "gpu_transport_min_bytes": 4096,
+            "gpu_memory_pressure_threshold": 0.8,
+        })
+        h = connector.health()
+        assert h["gpu_transport_min_bytes"] == 4096
+        assert h["gpu_memory_pressure_threshold"] == 0.8
+        assert "gpu_tensors_inlined" in h
+        assert "inline_bytes" in h
+        assert "pressure_fallbacks" in h
+        assert "current_registry_size" in h
+        assert "gpu_free_memory_ratio" in h
+        connector.close()

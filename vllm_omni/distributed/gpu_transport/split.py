@@ -10,6 +10,7 @@ them on the receiver side.
 from __future__ import annotations
 
 import io
+import pickle
 import uuid
 from typing import Any
 
@@ -99,7 +100,7 @@ def split_gpu_tensors(
             _GPUX_MARKER: True,
             "tensor_id": handle.tensor_id,
             "meta": handle.metadata.to_dict(),
-            "ipc_args": handle.metadata.ipc_args,
+            "ipc_args": pickle.dumps(handle.metadata.ipc_args),
         }
         logger.debug(
             "split: replaced tensor id=%s shape=%s",
@@ -135,7 +136,11 @@ def reassemble_gpu_tensors(obj: Any, transport: Any) -> Any:
             return tensor
         # IPC path (original)
         meta = TensorMetadata.from_dict(obj["meta"])
-        meta.ipc_args = obj["ipc_args"]
+        meta.ipc_args = (
+            pickle.loads(obj["ipc_args"])
+            if isinstance(obj["ipc_args"], bytes)
+            else obj["ipc_args"]
+        )
         handle = TransportHandle(tensor_id=obj["tensor_id"], metadata=meta)
         tensor = transport.recv(
             handle,

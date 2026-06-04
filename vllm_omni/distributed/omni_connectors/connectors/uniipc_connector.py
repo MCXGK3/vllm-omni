@@ -115,6 +115,18 @@ class UniIPCConnector(OmniConnectorBase):
         _load("cuda_ipc_transport", "cuda_ipc_transport.py")
         _load("cuda_copy_transport", "cuda_copy_transport.py")
 
+        # Ensure the gpu_transport package itself is loaded (not a stub),
+        # so create_transport is importable from it.
+        pkg_name = "vllm_omni.distributed.gpu_transport"
+        pkg_path = os.path.join(gpu_base, "__init__.py")
+        if os.path.isfile(pkg_path):
+            spec = importlib.util.spec_from_file_location(pkg_name, pkg_path)
+            pkg_mod = importlib.util.module_from_spec(spec)
+            pkg_mod.__package__ = pkg_name
+            pkg_mod.__path__ = [gpu_base]
+            sys.modules[pkg_name] = pkg_mod
+            spec.loader.exec_module(pkg_mod)
+
         from vllm_omni.distributed.gpu_transport.config import GPUTransportConfig
         from vllm_omni.distributed.gpu_transport import create_transport
 
