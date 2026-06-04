@@ -343,19 +343,27 @@ def thinker2talker_async_chunk(
                 return None
         else:
             save_payload = transfer_manager.request_payload.pop(request_id)
-            talker_additional_info["embed"]["prefill"] = torch.cat(
-                (
-                    save_payload.get("embed", {}).get("prefill"),
-                    talker_additional_info.get("embed", {}).get("prefill"),
-                ),
-                dim=0,
+            # Combine chunk-0 and chunk-1 tensors along dim 0 (seq_len).
+            # Guard against shape mismatches that can occur when the two
+            # chunks have different hidden dimensions (e.g. prefill vs
+            # decode projection heads).
+            def _safe_cat(saved: torch.Tensor, current: torch.Tensor) -> torch.Tensor:
+                if saved.shape[1:] != current.shape[1:]:
+                    logger.warning(
+                        "Chunk merge shape mismatch: saved%s current%s, "
+                        "using current chunk only",
+                        tuple(saved.shape), tuple(current.shape),
+                    )
+                    return current
+                return torch.cat((saved, current), dim=0)
+
+            talker_additional_info["embed"]["prefill"] = _safe_cat(
+                save_payload.get("embed", {}).get("prefill"),
+                talker_additional_info.get("embed", {}).get("prefill"),
             )
-            talker_additional_info["hidden_states"]["output"] = torch.cat(
-                (
-                    save_payload.get("hidden_states", {}).get("output"),
-                    talker_additional_info.get("hidden_states", {}).get("output"),
-                ),
-                dim=0,
+            talker_additional_info["hidden_states"]["output"] = _safe_cat(
+                save_payload.get("hidden_states", {}).get("output"),
+                talker_additional_info.get("hidden_states", {}).get("output"),
             )
     else:
         output_token_ids = request.output_token_ids
