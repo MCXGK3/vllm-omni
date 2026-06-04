@@ -314,6 +314,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if cached_ic is not None:
             cached_ic.pop(external_req_id, None)
 
+        # Release GPU transport tensors held for this request
+        self.connector.cleanup(external_req_id)
+
     def cleanup(
         self,
         request_id: str,
