@@ -39,6 +39,31 @@ def _layer_tensor(layers: dict[Any, Any], key: str) -> torch.Tensor | None:
     return val if isinstance(val, torch.Tensor) else None
 
 
+def _reconstruct_ipc_tensor(data: Any, dst_device: str = "cuda:7") -> torch.Tensor | None:
+    """If *data* is a ``__gpux__`` IPC marker dict, rebuild the GPU tensor.
+
+    Returns the reconstructed GPU tensor, or None if *data* is not an IPC marker.
+    The tensor is a zero-copy view of the producer's GPU memory.
+    """
+    import pickle
+
+    if not isinstance(data, dict) or not data.get("__gpux__"):
+        return None
+    try:
+        from vllm_omni.distributed.gpu_transport.ipc_utils import rebuild_from_ipc_args
+
+        ipc_args = pickle.loads(data["ipc_args"])
+        with torch.cuda.device(dst_device):
+            return rebuild_from_ipc_args(ipc_args)
+    except Exception:
+        logger.warning(
+            "Failed to reconstruct GPU tensor from IPC args for id=%s",
+            data.get("tensor_id", "unknown"),
+            exc_info=True,
+        )
+        return None
+
+
 def _compute_talker_prompt_ids_length(info: OmniPayload, device: torch.device | str = "cuda") -> int:
     im_start_token_id = 151644
     system_token_id = 8948
@@ -297,6 +322,16 @@ def thinker2talker_async_chunk(
     thinker_embed = pooling_output.get("embed", {}) if isinstance(pooling_output.get("embed", {}), dict) else {}
     thinker_emb = _layer_tensor(thinker_layers, _EMBED_LAYER_KEY)
     thinker_hid = _layer_tensor(thinker_layers, _HIDDEN_LAYER_KEY)
+
+    # If the engine exported these via CUDA IPC, reconstruct GPU tensors.
+    _dst = "cuda:7"  # talker GPU
+    if thinker_emb is None:
+        _raw = thinker_layers.get(int(_EMBED_LAYER_KEY)) or thinker_layers.get(_EMBED_LAYER_KEY)
+        thinker_emb = _reconstruct_ipc_tensor(_raw, dst_device=_dst)
+    if thinker_hid is None:
+        _raw = thinker_layers.get(int(_HIDDEN_LAYER_KEY)) or thinker_layers.get(_HIDDEN_LAYER_KEY)
+        thinker_hid = _reconstruct_ipc_tensor(_raw, dst_device=_dst)
+
     if thinker_emb is None or thinker_hid is None:
         logger.debug(
             "thinker2talker_async_chunk: missing thinker layers for req=%s (embed=%s hidden=%s)",
