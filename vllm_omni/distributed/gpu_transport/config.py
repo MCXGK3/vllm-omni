@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from multiprocessing.connection import Connection
 from typing import Literal
 
-TransportMode = Literal["cuda_ipc", "cuda_copy"]
+TransportMode = Literal["cuda_ipc", "cuda_copy", "none"]
 
 
 @dataclass

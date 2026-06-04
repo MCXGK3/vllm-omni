@@ -14,6 +14,8 @@ def create_transport(config: GPUTransportConfig):
         return CudaIpcTransport(config)
     elif config.mode == "cuda_copy":
         return CudaCopyTransport(config)
+    elif config.mode == "none":
+        return None
     raise ValueError(f"Unknown transport mode: {config.mode}")
 
 
