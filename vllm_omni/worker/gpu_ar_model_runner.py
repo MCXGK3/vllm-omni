@@ -620,6 +620,18 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         kv_connector_output,
                     )
 
+                # Guard against out-of-bounds logits_indices from large
+                # concurrent batches where scheduler model disagree on lengths.
+                if logits_indices.numel() > 0:
+                    max_idx = logits_indices.max().item()
+                    hs_len = hidden_states.shape[0]
+                    if max_idx >= hs_len:
+                        logger.warning(
+                            "logits_indices OOB: max=%d hidden_states=%d, clamping",
+                            max_idx, hs_len,
+                        )
+                        logits_indices = logits_indices.clamp(0, hs_len - 1)
+
                 sample_hidden_states = hidden_states[logits_indices]
                 # Try with sampling_metadata first; fall back to without for models that don't support it
                 try:
