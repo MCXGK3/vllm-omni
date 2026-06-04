@@ -297,12 +297,12 @@ class UniIPCConnector(OmniConnectorBase):
             logger.exception("UniIPC get failed for key=%s", get_key)
             return None
 
-    def cleanup(self, request_id: str) -> None:
-        """Clean SHM segments and release transport-held tensors."""
-        self._shm.cleanup(request_id)
-        # Release GPU transport tensors for this request.
-        # Always prune the tracking dict, even when transport is None
-        # (mode "none"), to avoid unbounded memory growth.
+    def release_gpu_tensors(self, request_id: str) -> None:
+        """Release GPU transport tensors for *request_id* without touching SHM.
+
+        Called from the sender side when a request is finished.  SHM
+        segments are managed separately by the receiver side.
+        """
         prefix = f"{request_id}_"
         keys = [k for k in list(self._pending_gpu_tensors) if k.startswith(prefix)]
         for key in keys:
@@ -315,6 +315,11 @@ class UniIPCConnector(OmniConnectorBase):
                             "Failed to release GPU tensor %s for key %s",
                             tid, key, exc_info=True,
                         )
+
+    def cleanup(self, request_id: str) -> None:
+        """Clean SHM segments and release transport-held tensors."""
+        self._shm.cleanup(request_id)
+        self.release_gpu_tensors(request_id)
 
     def close(self) -> None:
         """Release SHM connector and GPU transport."""
