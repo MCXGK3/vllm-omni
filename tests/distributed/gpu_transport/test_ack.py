@@ -271,7 +271,6 @@ def test_cuda_ipc_notify_consumed_sends_ack():
 
     producer = CudaIpcTransport(GPUTransportConfig(
         mode="cuda_ipc", src_device=0, dst_device=0,
-        ack_conn=prod_conn,
     ))
 
     consumer = CudaIpcTransport(GPUTransportConfig(
