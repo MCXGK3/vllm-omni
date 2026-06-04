@@ -49,12 +49,24 @@ class UniIPCConnector(OmniConnectorBase):
             config.get("release_timeout_ms", 10_000.0))
         self._transport: Any = None  # lazy-init
 
+        # Size threshold: skip GPU transport for small tensors (0 = disabled)
+        self._gpu_transport_min_bytes: int = int(
+            config.get("gpu_transport_min_bytes", 65536))
+
+        # Memory pressure threshold: fall back to inline when free ratio < threshold
+        # 0.0 disables pressure checking
+        self._gpu_memory_pressure_threshold: float = float(
+            config.get("gpu_memory_pressure_threshold", 0.0))
+
         self._metrics: dict[str, int] = {
             "puts": 0,
             "gets": 0,
             "bytes_transferred": 0,
             "gpu_tensors_sent": 0,
             "gpu_tensors_recv": 0,
+            "gpu_tensors_inlined": 0,
+            "inline_bytes": 0,
+            "pressure_fallbacks": 0,
         }
 
     # ------------------------------------------------------------------
@@ -68,6 +80,10 @@ class UniIPCConnector(OmniConnectorBase):
         the full ``vllm_omni.__init__`` import chain.
         """
         if self._transport is not None:
+            return
+
+        # "none" mode: no transport needed, router always returns "inline"
+        if self._transport_mode == "none":
             return
 
         import importlib.util
@@ -110,6 +126,42 @@ class UniIPCConnector(OmniConnectorBase):
         )
         self._transport = create_transport(transport_config)
 
+    def _route_tensor(self, tensor: "torch.Tensor") -> str:
+        """Decide transport strategy for a single GPU tensor.
+
+        Returns ``"inline"`` to serialize to CPU bytes in the marker,
+        or ``"ipc"`` to use the GPU transport (CUDA IPC / copy).
+
+        Checks are evaluated in order: mode, size, memory pressure.
+        """
+        import torch
+
+        # Dimension 1: mode "none" always inlines
+        if self._transport_mode == "none":
+            self._metrics["gpu_tensors_inlined"] += 1
+            return "inline"
+
+        nbytes = tensor.numel() * tensor.element_size()
+
+        # Dimension 2: size threshold
+        if nbytes < self._gpu_transport_min_bytes:
+            self._metrics["gpu_tensors_inlined"] += 1
+            self._metrics["inline_bytes"] += nbytes
+            return "inline"
+
+        # Dimension 3: memory pressure (producer-side only for cuda_ipc)
+        if (self._transport_mode == "cuda_ipc"
+                and self._gpu_memory_pressure_threshold > 0.0):
+            free, total = torch.cuda.mem_get_info(tensor.device)
+            ratio = free / total
+            if ratio < self._gpu_memory_pressure_threshold:
+                self._metrics["gpu_tensors_inlined"] += 1
+                self._metrics["inline_bytes"] += nbytes
+                self._metrics["pressure_fallbacks"] += 1
+                return "inline"
+
+        return "ipc"
+
     @staticmethod
     def _has_gpu(obj: Any) -> bool:
         """Return True if *obj* contains any CUDA tensors (inline, no imports)."""
@@ -129,7 +181,11 @@ class UniIPCConnector(OmniConnectorBase):
         self._init_transport()
         from vllm_omni.distributed.gpu_transport.split import (
             split_gpu_tensors)
-        obj = split_gpu_tensors(obj, self._transport)
+        obj = split_gpu_tensors(
+            obj, self._transport,
+            router=self._route_tensor,
+            dst_device=f"cuda:{self._dst_device}",
+        )
         self._metrics["gpu_tensors_sent"] += 1
         return obj
 
@@ -215,10 +271,25 @@ class UniIPCConnector(OmniConnectorBase):
             self._transport = None
 
     def health(self) -> dict[str, Any]:
-        return {
+        result = {
             "status": "healthy",
             "transport_mode": self._transport_mode,
             "src_device": self._src_device,
             "dst_device": self._dst_device,
+            "gpu_transport_min_bytes": self._gpu_transport_min_bytes,
+            "gpu_memory_pressure_threshold": self._gpu_memory_pressure_threshold,
             **self._metrics,
         }
+        # Add real-time registry size if transport is active
+        if self._transport is not None and hasattr(self._transport, 'registry_size'):
+            result["current_registry_size"] = self._transport.registry_size
+        else:
+            result["current_registry_size"] = 0
+        # Add current GPU free memory ratio
+        try:
+            import torch
+            free, total = torch.cuda.mem_get_info(self._src_device)
+            result["gpu_free_memory_ratio"] = round(free / total, 4)
+        except Exception:
+            result["gpu_free_memory_ratio"] = 0.0
+        return result

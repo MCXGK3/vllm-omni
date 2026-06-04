@@ -102,3 +102,173 @@ class TestUniIPCConnector:
         from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
         connectors = OmniConnectorFactory.list_registered_connectors()
         assert "UniIPCConnector" in connectors
+
+
+class TestUniIPCConnectorConfig:
+    """Tests for new configuration keys."""
+
+    def test_default_min_bytes(self):
+        """gpu_transport_min_bytes defaults to 65536."""
+        from vllm_omni.distributed.omni_connectors.connectors.uniipc_connector import (
+            UniIPCConnector,
+        )
+        connector = UniIPCConnector({
+            "stage_id": 0,
+            "gpu_transport_mode": "cuda_ipc",
+            "src_device": 0,
+            "dst_device": 1,
+        })
+        assert connector._gpu_transport_min_bytes == 65536
+        connector.close()
+
+    def test_custom_min_bytes(self):
+        """gpu_transport_min_bytes can be set via config."""
+        from vllm_omni.distributed.omni_connectors.connectors.uniipc_connector import (
+            UniIPCConnector,
+        )
+        connector = UniIPCConnector({
+            "stage_id": 0,
+            "gpu_transport_mode": "cuda_ipc",
+            "src_device": 0,
+            "dst_device": 1,
+            "gpu_transport_min_bytes": 1024,
+        })
+        assert connector._gpu_transport_min_bytes == 1024
+        connector.close()
+
+    def test_default_pressure_threshold(self):
+        """gpu_memory_pressure_threshold defaults to 0.0 (disabled)."""
+        from vllm_omni.distributed.omni_connectors.connectors.uniipc_connector import (
+            UniIPCConnector,
+        )
+        connector = UniIPCConnector({
+            "stage_id": 0,
+            "gpu_transport_mode": "cuda_ipc",
+            "src_device": 0,
+            "dst_device": 1,
+        })
+        assert connector._gpu_memory_pressure_threshold == 0.0
+        connector.close()
+
+    def test_custom_pressure_threshold(self):
+        """gpu_memory_pressure_threshold can be set via config."""
+        from vllm_omni.distributed.omni_connectors.connectors.uniipc_connector import (
+            UniIPCConnector,
+        )
+        connector = UniIPCConnector({
+            "stage_id": 0,
+            "gpu_transport_mode": "cuda_ipc",
+            "src_device": 0,
+            "dst_device": 1,
+            "gpu_memory_pressure_threshold": 0.5,
+        })
+        assert connector._gpu_memory_pressure_threshold == 0.5
+        connector.close()
+
+    def test_mode_none_parsed(self):
+        """gpu_transport_mode='none' is accepted."""
+        from vllm_omni.distributed.omni_connectors.connectors.uniipc_connector import (
+            UniIPCConnector,
+        )
+        connector = UniIPCConnector({
+            "stage_id": 0,
+            "gpu_transport_mode": "none",
+            "src_device": 0,
+            "dst_device": 1,
+        })
+        assert connector._transport_mode == "none"
+        connector.close()
+
+
+class TestUniIPCConnectorRouter:
+    """Tests for _route_tensor decisions."""
+
+    def test_router_small_tensor_goes_inline(self):
+        """Tensor below min_bytes returns 'inline'."""
+        from vllm_omni.distributed.omni_connectors.connectors.uniipc_connector import (
+            UniIPCConnector,
+        )
+        import torch
+        connector = UniIPCConnector({
+            "stage_id": 0,
+            "gpu_transport_mode": "cuda_ipc",
+            "src_device": 0,
+            "dst_device": 1,
+            "gpu_transport_min_bytes": 1024,
+        })
+        t = torch.ones(10, device="cuda:0", dtype=torch.float32)  # 40 bytes
+        assert connector._route_tensor(t) == "inline"
+        connector.close()
+
+    def test_router_large_tensor_goes_ipc(self):
+        """Tensor above min_bytes returns 'ipc'."""
+        from vllm_omni.distributed.omni_connectors.connectors.uniipc_connector import (
+            UniIPCConnector,
+        )
+        import torch
+        connector = UniIPCConnector({
+            "stage_id": 0,
+            "gpu_transport_mode": "cuda_ipc",
+            "src_device": 0,
+            "dst_device": 1,
+            "gpu_transport_min_bytes": 100,
+        })
+        t = torch.ones(100, device="cuda:0", dtype=torch.float32)  # 400 bytes
+        assert connector._route_tensor(t) == "ipc"
+        connector.close()
+
+    def test_router_mode_none_always_inline(self):
+        """Mode 'none' returns 'inline' regardless of size."""
+        from vllm_omni.distributed.omni_connectors.connectors.uniipc_connector import (
+            UniIPCConnector,
+        )
+        import torch
+        connector = UniIPCConnector({
+            "stage_id": 0,
+            "gpu_transport_mode": "none",
+            "src_device": 0,
+            "dst_device": 1,
+            "gpu_transport_min_bytes": 100,
+        })
+        t = torch.ones(1000, device="cuda:0", dtype=torch.float32)  # 4000 bytes
+        assert connector._route_tensor(t) == "inline"
+        connector.close()
+
+    def test_router_pressure_fallback(self):
+        """When free memory falls below threshold, returns 'inline'."""
+        from vllm_omni.distributed.omni_connectors.connectors.uniipc_connector import (
+            UniIPCConnector,
+        )
+        import torch
+        connector = UniIPCConnector({
+            "stage_id": 0,
+            "gpu_transport_mode": "cuda_ipc",
+            "src_device": 0,
+            "dst_device": 1,
+            "gpu_transport_min_bytes": 100,
+            "gpu_memory_pressure_threshold": 0.999,  # impossibly high
+        })
+        t = torch.ones(1000, device="cuda:0", dtype=torch.float32)
+        decision = connector._route_tensor(t)
+        # With threshold=0.999 essentially all free ratios are below it
+        assert decision == "inline"
+        assert connector._metrics["pressure_fallbacks"] >= 1
+        connector.close()
+
+    def test_router_pressure_disabled(self):
+        """With threshold=0.0, pressure check is skipped."""
+        from vllm_omni.distributed.omni_connectors.connectors.uniipc_connector import (
+            UniIPCConnector,
+        )
+        import torch
+        connector = UniIPCConnector({
+            "stage_id": 0,
+            "gpu_transport_mode": "cuda_ipc",
+            "src_device": 0,
+            "dst_device": 1,
+            "gpu_transport_min_bytes": 100,
+            "gpu_memory_pressure_threshold": 0.0,
+        })
+        t = torch.ones(1000, device="cuda:0", dtype=torch.float32)
+        assert connector._route_tensor(t) == "ipc"
+        connector.close()
