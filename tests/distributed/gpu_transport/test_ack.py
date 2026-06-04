@@ -10,6 +10,7 @@ cleanup works correctly.
 from __future__ import annotations
 
 import importlib.util
+import multiprocessing as mp
 import sys
 import time
 import types
@@ -89,7 +90,7 @@ _setup_vllm_omni_hierarchy()
 
 from vllm_omni.distributed.gpu_transport.config import GPUTransportConfig
 from vllm_omni.distributed.gpu_transport.cuda_ipc_transport import CudaIpcTransport
-from vllm_omni.distributed.gpu_transport.control_channel import ConsumerControl
+from vllm_omni.distributed.gpu_transport.control_channel import ConsumerControl, ProducerControl
 
 pytestmark = [pytest.mark.gpu]
 
@@ -160,3 +161,105 @@ class TestAckThread:
         transport.close()
         p1.close()
         p2.close()
+
+
+def _consumer_copy_ack_process(meta_conn, ack_conn, src_dev, dst_dev):
+    """Consumer that uses consumer_ack_conn to send copy_done ACK.
+
+    Runs in a spawned child process.
+    """
+    try:
+        _setup_vllm_omni_hierarchy()
+        from vllm_omni.distributed.gpu_transport.config import GPUTransportConfig
+        from vllm_omni.distributed.gpu_transport.cuda_copy_transport import CudaCopyTransport
+        from vllm_omni.distributed.gpu_transport.protocol import TensorMetadata, TransportHandle
+
+        transport = CudaCopyTransport(GPUTransportConfig(
+            mode="cuda_copy", src_device=src_dev, dst_device=dst_dev,
+            consumer_ack_conn=ack_conn,
+        ))
+
+        try:
+            msg = meta_conn.recv()
+            meta_dict = msg["metadata"]
+            ipc_args = msg["ipc_args"]
+            metadata = TensorMetadata.from_dict(meta_dict)
+            metadata.ipc_args = ipc_args
+            handle = TransportHandle(tensor_id=metadata.tensor_id, metadata=metadata)
+
+            tensor = transport.recv(handle, src_rank=src_dev, dst_device=f"cuda:{dst_dev}")
+            result_sum = tensor.sum().item()
+            meta_conn.send({"type": "result", "sum": result_sum})
+        finally:
+            transport.close()
+    except Exception as exc:
+        try:
+            meta_conn.send({"type": "error", "msg": str(exc)})
+        except Exception:
+            pass
+    finally:
+        meta_conn.close()
+        ack_conn.close()
+
+
+def test_cuda_copy_recv_sends_ack():
+    """CudaCopyTransport.recv() sends copy_done ACK after copy (cross-process)."""
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
+
+    meta_prod, meta_cons = mp.Pipe()
+    ack_prod, ack_cons = mp.Pipe()
+    src_dev, dst_dev = 0, 0
+
+    proc = mp.Process(
+        target=_consumer_copy_ack_process,
+        args=(meta_cons, ack_cons, src_dev, dst_dev),
+    )
+    proc.start()
+    meta_cons.close()
+    ack_cons.close()
+
+    from vllm_omni.distributed.gpu_transport.config import GPUTransportConfig
+    from vllm_omni.distributed.gpu_transport.cuda_copy_transport import CudaCopyTransport
+
+    producer = CudaCopyTransport(GPUTransportConfig(
+        mode="cuda_copy", src_device=src_dev, dst_device=dst_dev,
+    ))
+
+    import torch
+    tensor = torch.ones(4, dtype=torch.float32, device=f"cuda:{src_dev}")
+    expected_sum = tensor.sum().item()
+    handle = producer.send(tensor, dst_rank=dst_dev)
+
+    meta_prod.send({
+        "metadata": handle.metadata.to_dict(),
+        "ipc_args": handle.metadata.ipc_args,
+    })
+
+    # Wait for consumer result (data integrity) before checking ACK
+    result = meta_prod.recv()
+    if result["type"] == "error":
+        proc.join(timeout=5)
+        raise RuntimeError(
+            f"Consumer failed (exit={proc.exitcode}): {result['msg']}"
+        )
+    assert result["type"] == "result"
+    assert abs(result["sum"] - expected_sum) < 1e-3
+
+    # Producer should receive the ACK via ack_prod (consumer_ack_conn producer end)
+    from vllm_omni.distributed.gpu_transport.control_channel import ProducerControl
+    ctrl = ProducerControl(ack_prod)
+    msg = ctrl.recv_ack(timeout_ms=5000.0)
+    assert msg is not None, "Did not receive copy_done ACK"
+    assert msg.get("type") == "copy_done"
+    assert msg.get("tensor_id") == handle.tensor_id
+
+    proc.join(timeout=30)
+    assert proc.exitcode == 0, (
+        f"Consumer process failed with exit code {proc.exitcode}"
+    )
+    producer.close()
+    meta_prod.close()
+    ack_prod.close()

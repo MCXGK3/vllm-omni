@@ -130,12 +130,13 @@ class CudaCopyTransport:
 
         dst_dev = torch.device(dst_device) if isinstance(dst_device, str) else dst_device
 
-        # Check P2P capability
-        if not torch.cuda.can_device_access_peer(self._config.src_device, dst_dev.index):
-            raise RuntimeError(
-                f"P2P access not available from device {self._config.src_device} "
-                f"to {dst_dev}. Enable peer access or use cuda_ipc mode instead."
-            )
+        # Check P2P capability (skip for same-device, device can always access itself)
+        if self._config.src_device != dst_dev.index:
+            if not torch.cuda.can_device_access_peer(self._config.src_device, dst_dev.index):
+                raise RuntimeError(
+                    f"P2P access not available from device {self._config.src_device} "
+                    f"to {dst_dev}. Enable peer access or use cuda_ipc mode instead."
+                )
 
         t0 = time.perf_counter()
         # 1. Open IPC allocation (zero-copy view of producer memory)
@@ -156,6 +157,17 @@ class CudaCopyTransport:
             copy_event.record(copy_stream)
         copy_event.synchronize()
         t3 = time.perf_counter()
+
+        # 4. Send copy_done ACK so producer can release the original tensor
+        if self._consumer_ack_conn is not None:
+            try:
+                from .control_channel import ConsumerControl
+                ctrl = ConsumerControl(self._consumer_ack_conn)
+                ctrl.send_ack(meta.tensor_id, ack_type="copy_done")
+                logger.debug("recv: sent copy_done ACK for id=%s", meta.tensor_id)
+            except Exception:
+                logger.warning("recv: failed to send copy_done ACK for id=%s",
+                               meta.tensor_id, exc_info=True)
 
         logger.debug(
             "recv: id=%s shape=%s open_ms=%.3f alloc_ms=%.3f copy_ms=%.3f",
