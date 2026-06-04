@@ -9,6 +9,8 @@ them on the receiver side.
 """
 from __future__ import annotations
 
+import io
+import uuid
 from typing import Any
 
 import torch
@@ -32,16 +34,65 @@ def has_gpu_tensors(obj: Any) -> bool:
     return False
 
 
-def split_gpu_tensors(obj: Any, transport: Any) -> Any:
+def _make_inline_marker(tensor: torch.Tensor, dst_device: str) -> dict:
+    """Serialize a GPU tensor to CPU bytes and wrap in a ``__gpux__`` marker.
+
+    Uses ``torch.save`` for robust dtype handling (float32, float16,
+    bfloat16, int64, etc.).  The caller is responsible for ensuring the
+    tensor is small enough that inline serialization is appropriate.
+    """
+    cpu_tensor = tensor.detach().cpu().contiguous()
+    buf = io.BytesIO()
+    torch.save(cpu_tensor, buf)
+    return {
+        _GPUX_MARKER: True,
+        "tensor_id": uuid.uuid4().hex[:12],
+        "meta": {
+            "shape": list(cpu_tensor.shape),
+            "dtype": str(cpu_tensor.dtype),
+            "nbytes": cpu_tensor.numel() * cpu_tensor.element_size(),
+            "dst_device": dst_device,
+        },
+        "inline_data": buf.getvalue(),
+    }
+
+
+def _recover_inline_tensor(marker: dict) -> torch.Tensor:
+    """Recover a GPU tensor from an inline marker produced by
+    ``_make_inline_marker``.
+
+    The tensor is loaded on CPU and then moved to the device recorded
+    in the marker metadata.
+    """
+    buf = io.BytesIO(marker["inline_data"])
+    tensor = torch.load(buf)
+    dst_device = marker["meta"].get("dst_device", "cuda:0")
+    return tensor.to(dst_device)
+
+
+def split_gpu_tensors(
+    obj: Any,
+    transport: Any,
+    router: Any = None,
+    dst_device: str | None = None,
+) -> Any:
     """Walk *obj* and replace every CUDA tensor with a ``__gpux__`` marker.
 
-    The marker contains ``tensor_id`` and ``TensorMetadata.to_dict()`` plus IPC args.
-    The transport's ``send()`` is called for each tensor to store it in
-    the registry and extract IPC args.
+    If *router* is provided, it is called for each tensor and must return
+    ``"inline"`` or ``"ipc"``.  ``"inline"`` serializes the tensor to CPU
+    bytes via ``_make_inline_marker``; ``"ipc"`` uses the GPU transport.
 
-    Returns a (possibly modified) copy of *obj* with no GPU tensors.
+    If *router* is ``None``, all tensors go through the GPU transport
+    (original behaviour).
     """
     if isinstance(obj, torch.Tensor) and obj.is_cuda:
+        if router is not None:
+            decision = router(obj)
+            if decision == "inline":
+                return _make_inline_marker(
+                    obj, dst_device=dst_device or str(obj.device)
+                )
+        # Original IPC path
         handle = transport.send(obj, dst_rank=transport._config.dst_device)
         handle.metadata.ipc_args = transport._ipc_args_store[handle.tensor_id]
         marker = {
@@ -50,14 +101,18 @@ def split_gpu_tensors(obj: Any, transport: Any) -> Any:
             "meta": handle.metadata.to_dict(),
             "ipc_args": handle.metadata.ipc_args,
         }
-        logger.debug("split: replaced tensor id=%s shape=%s", handle.tensor_id, handle.metadata.shape)
+        logger.debug(
+            "split: replaced tensor id=%s shape=%s",
+            handle.tensor_id,
+            handle.metadata.shape,
+        )
         return marker
 
     if isinstance(obj, dict):
-        return {k: split_gpu_tensors(v, transport) for k, v in obj.items()}
+        return {k: split_gpu_tensors(v, transport, router=router, dst_device=dst_device) for k, v in obj.items()}
 
     if isinstance(obj, (list, tuple)):
-        return type(obj)(split_gpu_tensors(v, transport) for v in obj)
+        return type(obj)(split_gpu_tensors(v, transport, router=router, dst_device=dst_device) for v in obj)
 
     return obj
 
@@ -65,17 +120,33 @@ def split_gpu_tensors(obj: Any, transport: Any) -> Any:
 def reassemble_gpu_tensors(obj: Any, transport: Any) -> Any:
     """Walk *obj* and replace every ``__gpux__`` marker with a real GPU tensor.
 
-    The transport's ``recv()`` is called to reconstruct the tensor from
-    IPC args. The caller is responsible for calling ``release()`` after
-    the tensor is no longer needed.
+    Handles both IPC markers (original path) and inline markers
+    (``inline_data`` key present).
     """
     if isinstance(obj, dict) and obj.get(_GPUX_MARKER):
+        # Inline path: recover from CPU bytes
+        if "inline_data" in obj:
+            tensor = _recover_inline_tensor(obj)
+            logger.debug(
+                "reassemble: restored inline tensor id=%s shape=%s",
+                obj.get("tensor_id"),
+                obj["meta"]["shape"],
+            )
+            return tensor
+        # IPC path (original)
         meta = TensorMetadata.from_dict(obj["meta"])
         meta.ipc_args = obj["ipc_args"]
         handle = TransportHandle(tensor_id=obj["tensor_id"], metadata=meta)
-        tensor = transport.recv(handle, src_rank=transport._config.src_device,
-                               dst_device=meta.dst_device)
-        logger.debug("reassemble: restored tensor id=%s shape=%s", meta.tensor_id, meta.shape)
+        tensor = transport.recv(
+            handle,
+            src_rank=transport._config.src_device,
+            dst_device=meta.dst_device,
+        )
+        logger.debug(
+            "reassemble: restored tensor id=%s shape=%s",
+            meta.tensor_id,
+            meta.shape,
+        )
         return tensor
 
     if isinstance(obj, dict):

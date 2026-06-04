@@ -13,6 +13,7 @@ since ``rebuild_cuda_tensor`` requires a separate consumer process.
 from __future__ import annotations
 
 import importlib.util
+import io
 import multiprocessing as mp
 import sys
 import types
@@ -274,3 +275,71 @@ class TestSplitReassemble:
         )
         prod_transport.close()
         prod_conn.close()
+
+
+class TestInlineMarker:
+    """Tests for inline (CPU bytes) marker path -- no transport needed."""
+
+    def test_inline_marker_roundtrip_float32(self):
+        """Inline marker can roundtrip a float32 tensor correctly."""
+        from vllm_omni.distributed.gpu_transport.split import (
+            _make_inline_marker,
+            _recover_inline_tensor,
+        )
+        t = torch.randn(3, 4, device="cuda:0", dtype=torch.float32)
+        marker = _make_inline_marker(t, dst_device="cuda:0")
+        assert marker["__gpux__"] is True
+        assert "inline_data" in marker
+        assert "ipc_args" not in marker
+
+        restored = _recover_inline_tensor(marker)
+        assert restored.device.type == "cuda"
+        assert restored.shape == t.shape
+        assert restored.dtype == t.dtype
+        assert torch.allclose(restored, t)
+
+    def test_inline_marker_roundtrip_float16(self):
+        """Inline marker handles float16 correctly."""
+        from vllm_omni.distributed.gpu_transport.split import (
+            _make_inline_marker,
+            _recover_inline_tensor,
+        )
+        t = torch.randn(2, 8, device="cuda:0", dtype=torch.float16)
+        marker = _make_inline_marker(t, dst_device="cuda:0")
+        restored = _recover_inline_tensor(marker)
+        assert torch.allclose(restored, t)
+
+    def test_inline_marker_roundtrip_bfloat16(self):
+        """Inline marker handles bfloat16 correctly."""
+        from vllm_omni.distributed.gpu_transport.split import (
+            _make_inline_marker,
+            _recover_inline_tensor,
+        )
+        t = torch.randn(4, device="cuda:0", dtype=torch.bfloat16)
+        marker = _make_inline_marker(t, dst_device="cuda:0")
+        restored = _recover_inline_tensor(marker)
+        assert torch.allclose(restored, t)
+
+    def test_inline_marker_roundtrip_int64(self):
+        """Inline marker handles integer tensors."""
+        from vllm_omni.distributed.gpu_transport.split import (
+            _make_inline_marker,
+            _recover_inline_tensor,
+        )
+        t = torch.tensor([1, 2, 3], device="cuda:0", dtype=torch.int64)
+        marker = _make_inline_marker(t, dst_device="cuda:0")
+        restored = _recover_inline_tensor(marker)
+        assert torch.equal(restored, t)
+
+    def test_inline_marker_non_contiguous(self):
+        """Inline marker handles non-contiguous tensors."""
+        from vllm_omni.distributed.gpu_transport.split import (
+            _make_inline_marker,
+            _recover_inline_tensor,
+        )
+        t = torch.randn(4, 6, device="cuda:0")
+        sliced = t[:, ::2]  # non-contiguous
+        assert not sliced.is_contiguous()
+        marker = _make_inline_marker(sliced, dst_device="cuda:0")
+        restored = _recover_inline_tensor(marker)
+        assert torch.allclose(restored, sliced)
