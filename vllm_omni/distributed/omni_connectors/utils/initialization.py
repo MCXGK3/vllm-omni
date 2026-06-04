@@ -78,6 +78,9 @@ def initialize_connectors_from_config(
                 release_timeout_ms=getattr(gt_config, 'release_timeout_ms', 10000.0),
             )
             transport = create_transport(transport_config)
+            if transport is None:
+                logger.info("Skipping GPU transport for edge %s (mode=none)", edge)
+                continue
             # Wire ACK: producer gets producer_conn
             transport._ack_conn = chan.producer_conn
             transport._start_ack_thread() if hasattr(transport, '_start_ack_thread') else None
