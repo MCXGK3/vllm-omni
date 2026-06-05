@@ -177,6 +177,7 @@ class UniIPCConnector(OmniConnectorBase):
         if nbytes < self._gpu_transport_min_bytes:
             self._metrics["gpu_tensors_inlined"] += 1
             self._metrics["inline_bytes"] += nbytes
+            logger.info("UniIPC _route: inline tensor_bytes=%d < threshold=%d", nbytes, self._gpu_transport_min_bytes)
             return "inline"
 
         # Dimension 3: memory pressure (producer-side only for cuda_ipc)
