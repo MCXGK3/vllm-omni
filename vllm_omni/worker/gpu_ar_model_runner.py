@@ -764,6 +764,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         grammar_output: GrammarOutput | None,
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
         _t_sample = time.perf_counter()
+        # TIMING: talker step (sample_tokens entry)
+        if self.input_batch and self.input_batch.req_ids:
+            logger.info("TIMING talker_step req=%s", self.input_batch.req_ids[0])
         kv_extracted_req_ids = getattr(self, "kv_extracted_req_ids", None)
         self.kv_extracted_req_ids = None
 
@@ -970,6 +973,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             # Otherwise we don't have the mm CPU data yet, so we still need to build it
             if self.omni_prefix_cache is None:
                 mm_cpu = build_mm_cpu(flatten_payload(multimodal_outputs))
+
+            # TIMING: talker received additional_information from connector recv path
+            if downstream_req_ids:
+                logger.info("TIMING talker_recv req=%s", downstream_req_ids[0])
 
             self._process_additional_information_updates(
                 hidden_states,
