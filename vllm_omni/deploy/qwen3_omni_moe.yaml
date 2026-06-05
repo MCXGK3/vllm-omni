@@ -14,6 +14,15 @@
 async_chunk: true
 
 connectors:
+  uniipc_thinker_to_talker:
+    name: UniIPCConnector
+    extra:
+      gpu_transport_mode: cuda_copy
+      src_device: 0
+      dst_device: 4
+      gpu_transport_min_bytes: 65536
+      gpu_memory_pressure_threshold: 0.85
+
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
@@ -45,7 +54,7 @@ stages:
     enable_prefix_caching: false
     devices: "4"
     input_connectors:
-      from_stage_0: connector_of_shared_memory
+      from_stage_0: uniipc_thinker_to_talker
     default_sampling_params:
       temperature: 0.9
       top_k: 50
