@@ -900,8 +900,18 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     multimodal_outputs,
                     scheduler_output.num_scheduled_tokens,
                 )
+                mm_gpu = {}
             else:
-                mm_cpu = build_mm_cpu(flatten_payload(multimodal_outputs))
+                multimodal_flat = flatten_payload(multimodal_outputs)
+                mm_gpu = {
+                    k: v for k, v in multimodal_flat.items()
+                    if k.startswith("hidden_states.")
+                }
+                mm_other = {
+                    k: v for k, v in multimodal_flat.items()
+                    if not k.startswith("hidden_states.")
+                }
+                mm_cpu = build_mm_cpu(mm_other)
 
             self._process_additional_information_updates(
                 hidden_states,
@@ -960,6 +970,18 @@ class NPUARModelRunner(OmniNPUModelRunner):
                                 pass_lists_through=False,
                                 seq_len=seq_len,
                             )
+                    payload.update(mm_payload)
+
+                if mm_gpu:
+                    for mm_key, mm_val in mm_gpu.items():
+                        mm_payload[mm_key] = to_payload_element(
+                            element=mm_val,
+                            idx=idx,
+                            start=start,
+                            end=end,
+                            pass_lists_through=False,
+                            seq_len=seq_len,
+                        )
                     payload.update(mm_payload)
                 pooler_output.append(flatten_payload(payload))
 

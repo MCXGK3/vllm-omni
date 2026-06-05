@@ -906,7 +906,20 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 )
             # Otherwise we don't have the mm CPU data yet, so we still need to build it
             if self.omni_prefix_cache is None:
-                mm_cpu = build_mm_cpu(flatten_payload(multimodal_outputs))
+                multimodal_flat = flatten_payload(multimodal_outputs)
+                # Keep hidden_states layers on GPU for CUDA IPC transport.
+                # build_mm_cpu would move them to CPU, defeating the purpose.
+                mm_gpu: dict[str, object] = {
+                    k: v for k, v in multimodal_flat.items()
+                    if k.startswith("hidden_states.")
+                }
+                mm_other = {
+                    k: v for k, v in multimodal_flat.items()
+                    if not k.startswith("hidden_states.")
+                }
+                mm_cpu = build_mm_cpu(mm_other)
+            else:
+                mm_gpu = {}
 
             self._process_additional_information_updates(
                 hidden_states,
@@ -973,6 +986,20 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                                 pass_lists_through=False,
                                 seq_len=seq_len,
                             )
+                    payload.update(mm_payload)
+
+                if mm_gpu:
+                    for mm_key, mm_val in mm_gpu.items():
+                        # Keep hidden_states layers on GPU — slice per-request.
+                        # to_payload_element handles tensor slicing; preserves device.
+                        mm_payload[mm_key] = to_payload_element(
+                            element=mm_val,
+                            idx=idx,
+                            start=start,
+                            end=end,
+                            pass_lists_through=False,
+                            seq_len=seq_len,
+                        )
                     payload.update(mm_payload)
                 # Flatten nested dicts to dotted keys so pooling_output
                 # stays dict[str, torch.Tensor] for msgspec serialization.
