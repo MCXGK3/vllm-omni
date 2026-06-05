@@ -11,6 +11,8 @@ from copy import copy
 from dataclasses import replace
 from typing import Any, NamedTuple
 
+import time
+
 import numpy as np
 import torch
 from vllm.config import CUDAGraphMode
@@ -761,6 +763,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self,
         grammar_output: GrammarOutput | None,
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        _t_sample = time.perf_counter()
         kv_extracted_req_ids = getattr(self, "kv_extracted_req_ids", None)
         self.kv_extracted_req_ids = None
 
@@ -776,15 +779,21 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             self.kv_connector_output = None
             # Nothing to do (PP non-final rank case), output isn't used.
             if not kv_connector_output:
+                _sample_ms = (time.perf_counter() - _t_sample) * 1000.0
+                logger.info("TIMING sample_tokens total_ms=%.2f", _sample_ms)
                 return None  # type: ignore[return-value]
 
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
             if kv_connector_output.is_empty():
+                _sample_ms = (time.perf_counter() - _t_sample) * 1000.0
+                logger.info("TIMING sample_tokens total_ms=%.2f", _sample_ms)
                 return EMPTY_MODEL_RUNNER_OUTPUT
 
             output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
             output.kv_connector_output = kv_connector_output
+            _sample_ms = (time.perf_counter() - _t_sample) * 1000.0
+            logger.info("TIMING sample_tokens total_ms=%.2f", _sample_ms)
             return output
 
         # Unpack ephemeral state.
@@ -930,7 +939,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     hidden_states_cpu = self._export_hidden_to_ipc(_hs)
                 except Exception:
                     logger.warning("IPC export failed for hidden_states_cpu, falling back to CPU", exc_info=True)
+                    _t_cpu = time.perf_counter()
                     hidden_states_cpu = _hs.to("cpu").contiguous()
+                    _cpu_ms = (time.perf_counter() - _t_cpu) * 1000.0
+                    logger.info("TIMING gpu2cpu batch tokens=%d ms=%.2f", num_valid_tokens, _cpu_ms)
             else:
                 req_hidden_states_cpu = {}
         num_scheduled_tokens_np = getattr(self, "_omni_num_scheduled_tokens_np", None)
@@ -980,7 +992,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         req_hidden_states_cpu[rid] = self._export_hidden_to_ipc(_hs)
                     except Exception:
                         logger.warning("IPC export failed for req %s, falling back to CPU", rid, exc_info=True)
+                        _t_cpu = time.perf_counter()
                         req_hidden_states_cpu[rid] = _hs.to("cpu").contiguous()
+                        _cpu_ms = (time.perf_counter() - _t_cpu) * 1000.0
+                        logger.info("TIMING gpu2cpu req=%s tokens=%d ms=%.2f", rid, end - start, _cpu_ms)
 
             pooler_output = []
             for rid in req_ids_output_copy:
@@ -1068,6 +1083,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             output.kv_extracted_req_ids = kv_extracted_req_ids
 
         if not self.use_async_scheduling:
+            _sample_ms = (time.perf_counter() - _t_sample) * 1000.0
+            logger.info("TIMING sample_tokens total_ms=%.2f", _sample_ms)
             return output
         with record_function_or_nullcontext("gpu_model_runner: AsyncGPUModelRunnerOutput"):
             async_output = AsyncGPUModelRunnerOutput(
@@ -1086,6 +1103,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 async_output.async_copy_ready_event,
             )
 
+        _sample_ms = (time.perf_counter() - _t_sample) * 1000.0
+        logger.info("TIMING sample_tokens total_ms=%.2f", _sample_ms)
         return async_output
 
     def shutdown(self) -> None:
