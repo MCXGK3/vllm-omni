@@ -134,7 +134,11 @@ class CudaCopyTransport:
 
         # Check P2P capability (skip for same-device, device can always access itself)
         if self._config.src_device != dst_dev.index:
-            if not torch.cuda.can_device_access_peer(self._config.src_device, dst_dev.index):
+            try:
+                has_peer = torch.cuda.can_device_access_peer(self._config.src_device, dst_dev.index)
+            except (RuntimeError, AssertionError):
+                has_peer = False
+            if not has_peer:
                 raise RuntimeError(
                     f"P2P access not available from device {self._config.src_device} "
                     f"to {dst_dev}. Enable peer access or use cuda_ipc mode instead."
