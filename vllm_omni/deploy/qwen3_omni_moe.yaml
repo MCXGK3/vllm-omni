@@ -64,9 +64,11 @@ connectors:
   uniipc_thinker_to_talker:
     name: UniIPCConnector
     extra:
-      gpu_transport_mode: none
+      gpu_transport_mode: cuda_copy
       src_device: 3
       dst_device: 7
+      gpu_transport_min_bytes: 65536
+      gpu_memory_pressure_threshold: 0.85
 
   # ============================================================
   # SharedMemoryConnector（stage 1->2）
