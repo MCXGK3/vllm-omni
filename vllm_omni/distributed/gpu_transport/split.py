@@ -58,6 +58,24 @@ def _make_inline_marker(tensor: torch.Tensor, dst_device: str) -> dict:
     }
 
 
+def _resolve_local_device(dst_device: str) -> torch.device:
+    """Resolve *dst_device* to a valid local CUDA device.
+
+    In multi-stage deployments the producer sets ``dst_device`` to the
+    physical GPU index (e.g. ``cuda:7``), but vLLM may remap that GPU
+    to a different index in the consumer process.  Falls back to the
+    current CUDA device when the requested device is not available.
+    """
+    try:
+        dev = torch.device(dst_device)
+        # Trigger device context to validate the ordinal is reachable.
+        with torch.cuda.device(dev):
+            pass
+        return dev
+    except (RuntimeError, torch.AcceleratorError):
+        return torch.device(torch.cuda.current_device())
+
+
 def _recover_inline_tensor(marker: dict) -> torch.Tensor:
     """Recover a GPU tensor from an inline marker produced by
     ``_make_inline_marker``.
@@ -68,7 +86,7 @@ def _recover_inline_tensor(marker: dict) -> torch.Tensor:
     buf = io.BytesIO(marker["inline_data"])
     tensor = torch.load(buf, weights_only=True)
     dst_device = marker["meta"].get("dst_device", "cuda:0")
-    return tensor.to(dst_device)
+    return tensor.to(_resolve_local_device(dst_device))
 
 
 def split_gpu_tensors(
@@ -145,7 +163,7 @@ def reassemble_gpu_tensors(obj: Any, transport: Any) -> Any:
         tensor = transport.recv(
             handle,
             src_rank=transport._config.src_device,
-            dst_device=meta.dst_device,
+            dst_device=_resolve_local_device(meta.dst_device),
         )
         logger.debug(
             "reassemble: restored tensor id=%s shape=%s",
