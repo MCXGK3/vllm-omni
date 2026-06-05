@@ -62,6 +62,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
         self.requests_with_ready_chunks = set()
         self.requests_origin_status = {}
+        self._save_enqueue_ts: dict[str, float] = {}  # req_id → enqueue time
 
     @classmethod
     def create_connector(cls, model_config: Any):
@@ -123,6 +124,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             "is_finished": request.is_finished(),
         }
         self._pending_save_reqs.append(task)
+        self._save_enqueue_ts[request.external_req_id] = time.perf_counter()
         with self._save_cond:
             self._save_cond.notify()
 
@@ -237,6 +239,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         stage_id = self.connector.stage_id
         next_stage_id = stage_id + 1
         external_req_id = request.external_req_id
+        enqueue_ts = self._save_enqueue_ts.pop(external_req_id, None)
+        if enqueue_ts is not None:
+            queue_ms = (time.perf_counter() - enqueue_ts) * 1000.0
+            logger.info("TIMING queue_wait req=%s ms=%.2f", request.external_req_id, queue_ms)
         chunk_id = self.put_req_chunk[external_req_id]
         connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
         # Process payload in save_loop thread
