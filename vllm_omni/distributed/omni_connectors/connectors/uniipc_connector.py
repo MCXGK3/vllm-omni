@@ -171,12 +171,14 @@ class UniIPCConnector(OmniConnectorBase):
         if self._transport_mode == "none":
             self._metrics["gpu_tensors_inlined"] += 1
             self._metrics["inline_bytes"] += nbytes
+            logger.info("UniIPC _route: inline mode=none tensor_bytes=%d", nbytes)
             return "inline"
 
         # Dimension 2: size threshold
         if nbytes < self._gpu_transport_min_bytes:
             self._metrics["gpu_tensors_inlined"] += 1
             self._metrics["inline_bytes"] += nbytes
+            logger.info("UniIPC _route: inline size=%d < threshold=%d", nbytes, self._gpu_transport_min_bytes)
             return "inline"
 
         # Dimension 3: memory pressure (producer-side only for cuda_ipc)
@@ -206,7 +208,10 @@ class UniIPCConnector(OmniConnectorBase):
 
     def _split(self, obj: Any) -> Any:
         """Replace GPU tensors with ``__gpux__`` markers using the transport."""
-        if not self._has_gpu(obj):
+        import torch
+        has_gpu = self._has_gpu(obj)
+        logger.info("UniIPC _split: has_gpu=%s transport_mode=%s", has_gpu, self._transport_mode)
+        if not has_gpu:
             return obj
         self._init_transport()
         from vllm_omni.distributed.gpu_transport.split import (
