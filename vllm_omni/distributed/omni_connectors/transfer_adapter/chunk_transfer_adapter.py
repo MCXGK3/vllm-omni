@@ -153,13 +153,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return False
         payload_data, size = result
 
-        logger.info(
-            "TIMING get stage=%s->%s req=%s chunk=%s size=%d get_ms=%.2f",
-            target_stage_id, stage_id, external_req_id, chunk_id, size, get_ms,
-        )
-
         if payload_data:
             # Update connector state
+            _t_proc = time.perf_counter()
             self.get_req_chunk[req_id] += 1
 
             meta = payload_data.get("meta", {})
@@ -198,7 +194,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
             # Mark as finished for consumption
             self._finished_load_reqs.add(req_id)
-            logger.debug(f"[Stage-{stage_id}] Received one chunk for key {connector_get_key}")
+            proc_ms = (time.perf_counter() - _t_proc) * 1000.0
+            logger.info(
+                "TIMING get stage=%s->%s req=%s chunk=%s size=%d get_ms=%.2f proc_ms=%.2f",
+                target_stage_id, stage_id, external_req_id, chunk_id, size, get_ms, proc_ms,
+            )
             return True
 
         return False
@@ -246,6 +246,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         chunk_id = self.put_req_chunk[external_req_id]
         connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
         # Process payload in save_loop thread
+        _t_build = time.perf_counter()
         payload_data = None
         if self.custom_process_next_stage_input_func:
             try:
@@ -262,6 +263,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if not payload_data:
             return
 
+        _build_ms = (time.perf_counter() - _t_build) * 1000.0
+        logger.info("TIMING send_build_payload req=%s chunk=%s ms=%.2f",
+                     external_req_id, chunk_id, _build_ms)
+
         t0 = time.perf_counter()
         success, size, metadata = self.connector.put(
             from_stage=str(stage_id),
@@ -273,7 +278,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if success:
             self.put_req_chunk[external_req_id] += 1
-            logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
             logger.info(
                 "TIMING put stage=%s->%s req=%s chunk=%s size=%d put_ms=%.2f",
                 stage_id, next_stage_id, external_req_id, chunk_id, size, put_ms,

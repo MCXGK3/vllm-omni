@@ -177,7 +177,6 @@ class UniIPCConnector(OmniConnectorBase):
         if nbytes < self._gpu_transport_min_bytes:
             self._metrics["gpu_tensors_inlined"] += 1
             self._metrics["inline_bytes"] += nbytes
-            logger.info("UniIPC _route: inline tensor_bytes=%d < threshold=%d", nbytes, self._gpu_transport_min_bytes)
             return "inline"
 
         # Dimension 3: memory pressure (producer-side only for cuda_ipc)
@@ -189,10 +188,8 @@ class UniIPCConnector(OmniConnectorBase):
                 self._metrics["gpu_tensors_inlined"] += 1
                 self._metrics["inline_bytes"] += nbytes
                 self._metrics["pressure_fallbacks"] += 1
-                logger.info("UniIPC _route: inline memory_pressure=%f < threshold=%f", ratio, self._gpu_memory_pressure_threshold)
                 return "inline"
 
-        logger.info("UniIPC _route: ipc tensor_bytes=%d", nbytes)
         return "ipc"
 
     @staticmethod
@@ -209,9 +206,19 @@ class UniIPCConnector(OmniConnectorBase):
 
     def _split(self, obj: Any) -> Any:
         """Replace GPU tensors with ``__gpux__`` markers using the transport."""
-        if not self._has_gpu(obj):
+        import time as _time
+        _t0 = _time.perf_counter()
+        has_gpu = self._has_gpu(obj)
+        _has_ms = (_time.perf_counter() - _t0) * 1000.0
+        if not has_gpu:
+            logger.info("TIMING split_has_gpu ms=%.3f has_gpu=%s", _has_ms, has_gpu)
             return obj
+
+        _t1 = _time.perf_counter()
         self._init_transport()
+        _init_ms = (_time.perf_counter() - _t1) * 1000.0
+
+        _t2 = _time.perf_counter()
         from vllm_omni.distributed.gpu_transport.split import (
             split_gpu_tensors)
         obj = split_gpu_tensors(
@@ -219,7 +226,12 @@ class UniIPCConnector(OmniConnectorBase):
             router=self._route_tensor,
             dst_device=f"cuda:{self._dst_device}",
         )
+        _split_ms = (_time.perf_counter() - _t2) * 1000.0
         self._metrics["gpu_tensors_sent"] += 1
+
+        _total = (_time.perf_counter() - _t0) * 1000.0
+        logger.info("TIMING split_total ms=%.2f has_gpu_ms=%.3f init_transport_ms=%.3f split_tensors_ms=%.2f",
+                     _total, _has_ms, _init_ms, _split_ms)
         return obj
 
     def _reassemble(self, obj: Any) -> Any:
@@ -276,20 +288,30 @@ class UniIPCConnector(OmniConnectorBase):
         data: Any,
     ) -> tuple[bool, int, dict[str, Any] | None]:
         """Split GPU tensors, delegate metadata to SHM connector."""
-        t0 = time.perf_counter()
+        import time as _time
+        t0 = _time.perf_counter()
         try:
+            _t_split = _time.perf_counter()
             stripped = self._split(data)
+            _split_total_ms = (_time.perf_counter() - _t_split) * 1000.0
+
             # Track GPU transport tensor_ids for per-request ACK
             tensor_ids = self._collect_tensor_ids(stripped)
             if tensor_ids:
                 self._pending_gpu_tensors[put_key] = tensor_ids
+
+            _t_shm = _time.perf_counter()
             success, size, metadata = self._shm.put(
                 from_stage, to_stage, put_key, stripped)
+            _shm_ms = (_time.perf_counter() - _t_shm) * 1000.0
+            logger.info("TIMING put_internal split_ms=%.2f shm_put_ms=%.2f size=%d",
+                         _split_total_ms, _shm_ms, size)
+
             if not success:
                 return False, 0, None
             self._metrics["puts"] += 1
             self._metrics["bytes_transferred"] += size
-            self._metrics["put_total_ms"] += (time.perf_counter() - t0) * 1000.0
+            self._metrics["put_total_ms"] += (_time.perf_counter() - t0) * 1000.0
             return True, size, metadata
         except Exception:
             logger.exception("UniIPC put failed for key=%s", put_key)
@@ -303,15 +325,25 @@ class UniIPCConnector(OmniConnectorBase):
         metadata: dict[str, Any] | None = None,
     ) -> tuple[Any, int] | None:
         """Retrieve via SHM connector, then reassemble GPU tensors."""
-        t0 = time.perf_counter()
+        import time as _time
+        t0 = _time.perf_counter()
         try:
+            _t_shm = _time.perf_counter()
             result = self._shm.get(from_stage, to_stage, get_key, metadata)
+            _shm_get_ms = (_time.perf_counter() - _t_shm) * 1000.0
+
             if result is None:
                 return None
             obj, size = result
+
+            _t_reassemble = _time.perf_counter()
             obj = self._reassemble(obj)
+            _reassemble_ms = (_time.perf_counter() - _t_reassemble) * 1000.0
+            logger.info("TIMING get_internal shm_get_ms=%.2f reassemble_ms=%.2f size=%d",
+                         _shm_get_ms, _reassemble_ms, size)
+
             self._metrics["gets"] += 1
-            self._metrics["get_total_ms"] += (time.perf_counter() - t0) * 1000.0
+            self._metrics["get_total_ms"] += (_time.perf_counter() - t0) * 1000.0
             return obj, size
         except Exception:
             logger.exception("UniIPC get failed for key=%s", get_key)

@@ -36,22 +36,27 @@ def has_gpu_tensors(obj: Any) -> bool:
 
 
 def _make_inline_marker(tensor: torch.Tensor, dst_device: str) -> dict:
-    """Serialize a GPU tensor to CPU bytes and wrap in a ``__gpux__`` marker.
-
-    Uses ``torch.save`` for robust dtype handling (float32, float16,
-    bfloat16, int64, etc.).  The caller is responsible for ensuring the
-    tensor is small enough that inline serialization is appropriate.
-    """
+    """Serialize a GPU tensor to CPU bytes and wrap in a ``__gpux__`` marker."""
+    import time as _time
+    _t0 = _time.perf_counter()
     cpu_tensor = tensor.detach().cpu().contiguous()
+    _d2h_ms = (_time.perf_counter() - _t0) * 1000.0
+
+    _t1 = _time.perf_counter()
     buf = io.BytesIO()
     torch.save(cpu_tensor, buf)
+    _save_ms = (_time.perf_counter() - _t1) * 1000.0
+
+    nbytes = cpu_tensor.numel() * cpu_tensor.element_size()
+    logger.info("TIMING inline_marker_create shape=%s nbytes=%d d2h_ms=%.3f save_ms=%.3f",
+                 list(cpu_tensor.shape), nbytes, _d2h_ms, _save_ms)
     return {
         _GPUX_MARKER: True,
         "tensor_id": uuid.uuid4().hex[:12],
         "meta": {
             "shape": list(cpu_tensor.shape),
             "dtype": str(cpu_tensor.dtype),
-            "nbytes": cpu_tensor.numel() * cpu_tensor.element_size(),
+            "nbytes": nbytes,
             "dst_device": dst_device,
         },
         "inline_data": buf.getvalue(),
@@ -77,16 +82,22 @@ def _resolve_local_device(dst_device: str) -> torch.device:
 
 
 def _recover_inline_tensor(marker: dict) -> torch.Tensor:
-    """Recover a GPU tensor from an inline marker produced by
-    ``_make_inline_marker``.
-
-    The tensor is loaded on CPU and then moved to the device recorded
-    in the marker metadata.
-    """
+    """Recover a GPU tensor from an inline marker."""
+    import time as _time
+    _t0 = _time.perf_counter()
     buf = io.BytesIO(marker["inline_data"])
     tensor = torch.load(buf, weights_only=True)
+    _load_ms = (_time.perf_counter() - _t0) * 1000.0
+
+    _t1 = _time.perf_counter()
     dst_device = marker["meta"].get("dst_device", "cuda:0")
-    return tensor.to(_resolve_local_device(dst_device))
+    result = tensor.to(_resolve_local_device(dst_device))
+    _h2d_ms = (_time.perf_counter() - _t1) * 1000.0
+
+    nbytes = marker["meta"].get("nbytes", 0)
+    logger.info("TIMING inline_marker_recover nbytes=%d load_ms=%.3f h2d_ms=%.3f",
+                 nbytes, _load_ms, _h2d_ms)
+    return result
 
 
 def split_gpu_tensors(
@@ -143,15 +154,17 @@ def reassemble_gpu_tensors(obj: Any, transport: Any) -> Any:
     (``inline_data`` key present).
     """
     if isinstance(obj, dict) and obj.get(_GPUX_MARKER):
+        import time as _time
+        marker_type = "inline" if "inline_data" in obj else "ipc"
+        _t0 = _time.perf_counter()
+
         # Inline path: recover from CPU bytes
         if "inline_data" in obj:
             tensor = _recover_inline_tensor(obj)
-            logger.debug(
-                "reassemble: restored inline tensor id=%s shape=%s",
-                obj.get("tensor_id"),
-                obj["meta"]["shape"],
-            )
+            _elapsed = (_time.perf_counter() - _t0) * 1000.0
+            logger.info("TIMING reassemble_marker type=%s ms=%.3f", marker_type, _elapsed)
             return tensor
+
         # IPC path (original)
         meta = TensorMetadata.from_dict(obj["meta"])
         meta.ipc_args = (
@@ -165,11 +178,8 @@ def reassemble_gpu_tensors(obj: Any, transport: Any) -> Any:
             src_rank=transport._config.src_device,
             dst_device=_resolve_local_device(meta.dst_device),
         )
-        logger.debug(
-            "reassemble: restored tensor id=%s shape=%s",
-            meta.tensor_id,
-            meta.shape,
-        )
+        _elapsed = (_time.perf_counter() - _t0) * 1000.0
+        logger.info("TIMING reassemble_marker type=%s ms=%.3f", marker_type, _elapsed)
         return tensor
 
     if isinstance(obj, dict):

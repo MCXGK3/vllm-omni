@@ -3,6 +3,7 @@
 
 import fcntl
 import os
+import time as _time
 from multiprocessing import shared_memory as shm_pkg
 from typing import Any
 
@@ -47,20 +48,21 @@ class SharedMemoryConnector(OmniConnectorBase):
     ) -> tuple[bool, int, dict[str, Any] | None]:
         try:
             # Always serialize first to check size (and for SHM writing)
-            # Note: For extremely large objects in "inline" mode (e.g. Ray),
-            # we might double-serialize if we're not careful, but here we assume
-            # if it's huge we use SHM, or if Ray, threshold is maxsize.
+            _t_ser = _time.perf_counter()
             payload = self.serialize_obj(data)
             size = len(payload)
+            _ser_ms = (_time.perf_counter() - _t_ser) * 1000.0
 
             # Currently, we always use SHM.
             if True:
                 # Use Shared Memory
+                _t_write = _time.perf_counter()
                 lock_file = f"/dev/shm/shm_{put_key}_lockfile.lock"
                 with open(lock_file, "wb+") as lockf:
                     fcntl.flock(lockf, fcntl.LOCK_EX)
                     meta = shm_write_bytes(payload, name=put_key)
                     fcntl.flock(lockf, fcntl.LOCK_UN)
+                _write_ms = (_time.perf_counter() - _t_write) * 1000.0
 
                 # meta contains {'name': ..., 'size': ...}
                 metadata = {"shm": meta, "size": size}
@@ -68,14 +70,15 @@ class SharedMemoryConnector(OmniConnectorBase):
                 self._metrics["shm_writes"] += 1
             else:
                 # Inline - pass bytes directly to avoid double serialization of the object
-                # We already serialized it to check size, so we pass the bytes.
-                # The Queue will pickle these bytes (fast), avoiding re-serializing the complex object.
+                _write_ms = 0.0
                 metadata = {"inline_bytes": payload, "size": size}
                 self._metrics["inline_writes"] += 1
 
             self._metrics["puts"] += 1
             self._metrics["bytes_transferred"] += size
 
+            logger.info("TIMING shm_put ser_ms=%.2f write_ms=%.2f size=%d",
+                         _ser_ms, _write_ms, size)
             return True, size, metadata
 
         except Exception as e:
@@ -85,12 +88,21 @@ class SharedMemoryConnector(OmniConnectorBase):
     def _get_data_with_lock(self, lock_file: str, shm_handle: dict):
         obj = None
         try:
+            _t_read = _time.perf_counter()
             with open(lock_file, "rb+") as lockf:
                 fcntl.flock(lockf, fcntl.LOCK_EX)
                 data_bytes = shm_read_bytes(shm_handle)
                 fcntl.flock(lockf, fcntl.LOCK_UN)
+            _read_ms = (_time.perf_counter() - _t_read) * 1000.0
+
+            _t_deser = _time.perf_counter()
             obj = self.deserialize_obj(data_bytes)
-            return obj, int(shm_handle.get("size", 0))
+            _deser_ms = (_time.perf_counter() - _t_deser) * 1000.0
+
+            shm_size = int(shm_handle.get("size", 0))
+            logger.info("TIMING shm_get read_ms=%.2f deser_ms=%.2f size=%d",
+                         _read_ms, _deser_ms, shm_size)
+            return obj, shm_size
         except Exception as e:
             logger.error(f"SharedMemoryConnector shm get failed for req : {e}")
             return None
