@@ -437,6 +437,7 @@ async def async_request_openai_chat_omni_completions(
                                     elif modality == "audio":
                                         if output.audio_ttfp == 0.0:
                                             output.audio_ttfp = timestamp - st
+                                            output.ttft = output.audio_ttfp
                                         audio_generate_time = timestamp - st
                                         if content:
                                             audio_bytes = base64.b64decode(content)
