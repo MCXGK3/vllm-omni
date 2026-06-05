@@ -46,12 +46,14 @@ class CudaIpcTransport:
     def _ensure_peer_access(src: int, dst: int) -> None:
         for i in (src, dst):
             for j in (src, dst):
-                if i != j and not torch.cuda.can_device_access_peer(i, j):
-                    try:
+                if i == j:
+                    continue
+                try:
+                    if not torch.cuda.can_device_access_peer(i, j):
                         torch.cuda.device(i).enable_peer_access(j)
-                    except Exception as e:
-                        logger.warning(
-                            "Failed to enable P2P access device %d -> %d: %s", i, j, e)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to enable P2P access device %d -> %d: %s", i, j, e)
 
     def _start_ack_thread(self) -> None:
         """Start the ACK thread if ack_conn is set. Idempotent."""
