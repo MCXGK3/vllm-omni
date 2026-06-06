@@ -40,6 +40,7 @@ def _make_inline_marker(tensor: torch.Tensor, dst_device: str) -> dict:
     cpu_tensor = tensor.detach().cpu().contiguous()
     buf = io.BytesIO()
     torch.save(cpu_tensor, buf)
+    nbytes = cpu_tensor.numel() * cpu_tensor.element_size()
     return {
         _GPUX_MARKER: True,
         "tensor_id": uuid.uuid4().hex[:12],
