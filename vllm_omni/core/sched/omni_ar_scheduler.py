@@ -13,12 +13,12 @@ from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMSchedu
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.core.sched.utils import remove_all
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
-from vllm_omni.utils.nvtx import nvtx_range, nvtx_mark
+
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.output import OmniSchedulerOutput
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
@@ -190,28 +190,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return False
 
     def schedule(self) -> SchedulerOutput:  # type: ignore[override]
-        nvtx_mark("omni_ar:schedule_start")
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
-            # Reset queue-time tracking for pre-warmed requests that just
-            # received their first real chunk.  The pre-warm dummy request
-            # fires a QUEUED event too early (before upstream data exists);
-            # clearing events and re-recording QUEUED makes the subsequent
-            # SCHEDULED meaningful — queue_time then measures wait from
-            # real-data-ready until the scheduler admits the request.
-            for req_id in self.chunk_transfer_adapter.requests_with_ready_chunks:
-                request = self.requests.get(req_id)
-                if request is None:
-                    continue
-                if getattr(request, "_omni_first_real_chunk_handled", False):
-                    continue
-                request.events.clear()
-                request.record_event(EngineCoreEventType.QUEUED)
-                request._omni_first_real_chunk_handled = True
 
         try:
-            with nvtx_range("omni:base_schedule"):
-                scheduler_output = super().schedule()
+            scheduler_output = super().schedule()
         finally:
             if self.chunk_transfer_adapter:
                 # Add request waiting for chunk to the waiting and running queue
@@ -256,7 +239,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Wrap in omni scheduler output to carry transfer metadata.
         base_fields = SchedulerOutput.__dataclass_fields__.keys()
         base_data = {name: getattr(scheduler_output, name) for name in base_fields}
-        nvtx_mark("omni_ar:schedule_end")
         return OmniSchedulerOutput(
             **base_data,
             finished_requests_needing_kv_transfer=finished_reqs,
@@ -267,311 +249,316 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
-        with nvtx_range("omni_ar:update_from_output"):
-            sampled_token_ids = model_runner_output.sampled_token_ids
-            logprobs = model_runner_output.logprobs
-            prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
-            num_scheduled_tokens = scheduler_output.num_scheduled_tokens
-            pooler_outputs = model_runner_output.pooler_output
-            num_nans_in_logits = model_runner_output.num_nans_in_logits
-            kv_connector_output = model_runner_output.kv_connector_output
-            cudagraph_stats: CUDAGraphStat | None = model_runner_output.cudagraph_stats
+        sampled_token_ids = model_runner_output.sampled_token_ids
+        logprobs = model_runner_output.logprobs
+        prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
+        num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        pooler_outputs = model_runner_output.pooler_output
+        num_nans_in_logits = model_runner_output.num_nans_in_logits
+        kv_connector_output = model_runner_output.kv_connector_output
+        cudagraph_stats: CUDAGraphStat | None = model_runner_output.cudagraph_stats
 
-            perf_stats: PerfStats | None = None
-            if self.perf_metrics and self.perf_metrics.is_enabled():
-                perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)
+        perf_stats: PerfStats | None = None
+        if self.perf_metrics and self.perf_metrics.is_enabled():
+            perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)
 
-            outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
-            spec_decoding_stats: SpecDecodingStats | None = None
-            kv_connector_stats: KVConnectorStats | None = (
-                kv_connector_output.kv_connector_stats if kv_connector_output else None
+        outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
+        spec_decoding_stats: SpecDecodingStats | None = None
+        kv_connector_stats: KVConnectorStats | None = (
+            kv_connector_output.kv_connector_stats if kv_connector_output else None
+        )
+        if kv_connector_stats and self.connector:
+            kv_stats = self.connector.get_kv_connector_stats()
+            if kv_stats:
+                kv_connector_stats = kv_connector_stats.aggregate(kv_stats)
+
+        failed_kv_load_req_ids = None
+        if kv_connector_output and kv_connector_output.invalid_block_ids:
+            # These blocks contain externally computed tokens that failed to
+            # load. Identify affected requests and adjust their computed token
+            # count to trigger recomputation of the invalid blocks.
+            failed_kv_load_req_ids = self._handle_invalid_blocks(
+                kv_connector_output.invalid_block_ids,
+                num_scheduled_tokens,
             )
-            if kv_connector_stats and self.connector:
-                kv_stats = self.connector.get_kv_connector_stats()
-                if kv_stats:
-                    kv_connector_stats = kv_connector_stats.aggregate(kv_stats)
 
-            failed_kv_load_req_ids = None
-            if kv_connector_output and kv_connector_output.invalid_block_ids:
-                # These blocks contain externally computed tokens that failed to
-                # load. Identify affected requests and adjust their computed token
-                # count to trigger recomputation of the invalid blocks.
-                failed_kv_load_req_ids = self._handle_invalid_blocks(
-                    kv_connector_output.invalid_block_ids,
-                    num_scheduled_tokens,
+        # Pre-process KV extraction acks so that the per-request loop below
+        # can see up-to-date active_kv_transfers state and emit kv_ready
+        # signals while requests are still alive (before any deferred stop).
+        kv_extracted_ids = getattr(model_runner_output, "kv_extracted_req_ids", None)
+        if kv_extracted_ids:
+            for req_id in kv_extracted_ids:
+                try:
+                    self.active_kv_transfers.discard(req_id)
+                    req = self.requests.get(req_id)
+                    if req is not None and not req.is_finished():
+                        outputs[req.client_index].append(
+                            EngineCoreOutput(
+                                request_id=req_id,
+                                new_token_ids=[],
+                                kv_transfer_params={"kv_ready": True},
+                            )
+                        )
+                except Exception:
+                    init_logger(__name__).exception("Failed to pre-process KV extraction for %s", req_id)
+
+        # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
+        # the below loop can be a performance bottleneck. We should do our best
+        # to avoid expensive operations inside the loop.
+        stopped_running_reqs: set[Request] = set()
+        stopped_preempted_reqs: set[Request] = set()
+        for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
+            assert num_tokens_scheduled > 0
+            if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
+                # Skip requests that were recovered from KV load failure
+                continue
+            request = self.requests.get(req_id)
+            if request is None or request.is_finished():
+                # The request is already finished. This can happen if the
+                # request is aborted while the model is executing it (e.g.,
+                # in pipeline parallelism or async scheduling).
+                continue
+
+            req_index = model_runner_output.req_id_to_index[req_id]
+            generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
+
+            scheduled_spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+            if scheduled_spec_token_ids and generated_token_ids:
+                num_draft_tokens = len(scheduled_spec_token_ids)
+                num_accepted = len(generated_token_ids) - 1
+                num_rejected = num_draft_tokens - num_accepted
+                # num_computed_tokens represents the number of tokens
+                # processed in the current step, considering scheduled
+                # tokens and rejections. If some tokens are rejected,
+                # num_computed_tokens is decreased by the number of rejected
+                # tokens.
+                if request.num_computed_tokens > 0:
+                    request.num_computed_tokens -= num_rejected
+                # If async scheduling, num_output_placeholders also includes
+                # the scheduled spec tokens count and so is similarly adjusted.
+                if request.num_output_placeholders > 0:
+                    request.num_output_placeholders -= num_rejected
+                spec_decoding_stats = self.make_spec_decoding_stats(
+                    spec_decoding_stats,
+                    num_draft_tokens=num_draft_tokens,
+                    num_accepted_tokens=num_accepted,
+                    num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
+                    request_id=req_id,
                 )
 
-            # Pre-process KV extraction acks so that the per-request loop below
-            # can see up-to-date active_kv_transfers state and emit kv_ready
-            # signals while requests are still alive (before any deferred stop).
-            kv_extracted_ids = getattr(model_runner_output, "kv_extracted_req_ids", None)
-            if kv_extracted_ids:
-                for req_id in kv_extracted_ids:
-                    try:
-                        self.active_kv_transfers.discard(req_id)
-                        req = self.requests.get(req_id)
-                        if req is not None and not req.is_finished():
-                            outputs[req.client_index].append(
-                                EngineCoreOutput(
-                                    request_id=req_id,
-                                    new_token_ids=[],
-                                    kv_transfer_params={"kv_ready": True},
-                                )
-                            )
-                    except Exception:
-                        init_logger(__name__).exception("Failed to pre-process KV extraction for %s", req_id)
+            # Free encoder inputs only after the step has actually executed.
+            if request.has_encoder_inputs:
+                self._free_encoder_inputs(request)
 
-            # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
-            # the below loop can be a performance bottleneck. We should do our best
-            # to avoid expensive operations inside the loop.
-            stopped_running_reqs: set[Request] = set()
-            stopped_preempted_reqs: set[Request] = set()
-            for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
-                assert num_tokens_scheduled > 0
-                if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
-                    # Skip requests that were recovered from KV load failure
-                    continue
-                request = self.requests.get(req_id)
-                if request is None or request.is_finished():
-                    # The request is already finished. This can happen if the
-                    # request is aborted while the model is executing it (e.g.,
-                    # in pipeline parallelism or async scheduling).
-                    continue
+            stopped = False
+            is_segment_finished = False
+            new_logprobs = None
+            new_token_ids = generated_token_ids
+            pooler_output = pooler_outputs[req_index] if pooler_outputs else None
+            kv_transfer_params = None
+            status_before_stop = request.status
+            finish_reason = None
+            routed_experts = None
 
-                req_index = model_runner_output.req_id_to_index[req_id]
-                generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
+            # Check for stop and update request status.
+            if new_token_ids:
+                new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
+            elif request.pooling_params and pooler_output is not None:
+                # Pooling stops as soon as there is output.
+                request.status = RequestStatus.FINISHED_STOPPED
+                stopped = True
 
-                scheduled_spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
-                if scheduled_spec_token_ids and generated_token_ids:
-                    num_draft_tokens = len(scheduled_spec_token_ids)
-                    num_accepted = len(generated_token_ids) - 1
-                    num_rejected = num_draft_tokens - num_accepted
-                    # num_computed_tokens represents the number of tokens
-                    # processed in the current step, considering scheduled
-                    # tokens and rejections. If some tokens are rejected,
-                    # num_computed_tokens is decreased by the number of rejected
-                    # tokens.
-                    if request.num_computed_tokens > 0:
-                        request.num_computed_tokens -= num_rejected
-                    # If async scheduling, num_output_placeholders also includes
-                    # the scheduled spec tokens count and so is similarly adjusted.
-                    if request.num_output_placeholders > 0:
-                        request.num_output_placeholders -= num_rejected
-                    spec_decoding_stats = self.make_spec_decoding_stats(
-                        spec_decoding_stats,
-                        num_draft_tokens=num_draft_tokens,
-                        num_accepted_tokens=num_accepted,
-                        num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
-                        request_id=req_id,
+            # If criteria returns True, it means we must STOP the request.
+            # If criteria returns False, it might have triggered a background
+            # transfer (e.g. prefill finished / special token) but continues decoding.
+            if not stopped and self._process_kv_transfer_trigger(request, new_token_ids):
+                stopped = True
+
+            if new_token_ids and self.structured_output_manager.should_advance(request):
+                struct_output_request = request.structured_output_request
+                assert struct_output_request is not None
+                assert struct_output_request.grammar is not None
+                if not struct_output_request.grammar.accept_tokens(req_id, new_token_ids):
+                    logger.error(
+                        "Unexpected: grammar rejected tokens %s for request %s. Terminating request.",
+                        new_token_ids,
+                        req_id,
                     )
-
-                # Free encoder inputs only after the step has actually executed.
-                if request.has_encoder_inputs:
-                    self._free_encoder_inputs(request)
-
-                stopped = False
-                is_segment_finished = False
-                new_logprobs = None
-                new_token_ids = generated_token_ids
-                pooler_output = pooler_outputs[req_index] if pooler_outputs else None
-                kv_transfer_params = None
-                status_before_stop = request.status
-                finish_reason = None
-                routed_experts = None
-
-                # Check for stop and update request status.
-                if new_token_ids:
-                    new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
-                elif request.pooling_params and pooler_output is not None:
-                    # Pooling stops as soon as there is output.
-                    request.status = RequestStatus.FINISHED_STOPPED
+                    request.status = RequestStatus.FINISHED_ERROR
+                    request.resumable = False
                     stopped = True
 
-                # If criteria returns True, it means we must STOP the request.
-                # If criteria returns False, it might have triggered a background
-                # transfer (e.g. prefill finished / special token) but continues decoding.
-                if not stopped and self._process_kv_transfer_trigger(request, new_token_ids):
-                    stopped = True
+            if stopped:
+                routed_experts = self._get_routed_experts(request)
 
-                if new_token_ids and self.structured_output_manager.should_advance(request):
-                    struct_output_request = request.structured_output_request
-                    assert struct_output_request is not None
-                    assert struct_output_request.grammar is not None
-                    if not struct_output_request.grammar.accept_tokens(req_id, new_token_ids):
-                        logger.error(
-                            "Unexpected: grammar rejected tokens %s for request %s. Terminating request.",
-                            new_token_ids,
-                            req_id,
-                        )
-                        request.status = RequestStatus.FINISHED_ERROR
-                        request.resumable = False
-                        stopped = True
-
-                if stopped:
-                    routed_experts = self._get_routed_experts(request)
-
-                    # Capture finish_reason BEFORE _handle_stopped_request, which may
-                    # reset the status to WAITING for streaming requests that continue.
-                    finish_reason = request.get_finished_reason()
-                    is_segment_finished = request.is_finished() and request.resumable
-                    finished = self._handle_stopped_request(request)
-                    if finished:
-                        kv_transfer_params = self._free_request(request)
-                    if status_before_stop == RequestStatus.RUNNING:
-                        stopped_running_reqs.add(request)
-                    elif status_before_stop == RequestStatus.WAITING_FOR_CHUNK:
-                        # In async chunk mode, request may be in either queue.
-                        # Remove from both to avoid stale queue entries.
-                        stopped_running_reqs.add(request)
-                        stopped_preempted_reqs.add(request)
-                    else:
-                        stopped_preempted_reqs.add(request)
-
-                # Extract sample logprobs if needed.
-                if request.sampling_params is not None and request.sampling_params.logprobs is not None and logprobs:
-                    new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
-
-                if num_nans_in_logits is not None and req_id in num_nans_in_logits:
-                    request.num_nans_in_logits = num_nans_in_logits[req_id]
-
-                # Get prompt logprobs for this request.
-                prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-                if new_token_ids or pooler_output is not None or kv_transfer_params or stopped:
-                    # Add EngineCoreOutput for this Request.
-                    outputs[request.client_index].append(
-                        EngineCoreOutput(
-                            request_id=req_id,
-                            new_token_ids=new_token_ids,
-                            finish_reason=finish_reason,
-                            new_logprobs=new_logprobs,
-                            new_prompt_logprobs_tensors=prompt_logprobs_tensors,
-                            pooling_output=pooler_output,
-                            stop_reason=request.stop_reason,
-                            events=request.take_events(),
-                            prefill_stats=request.take_prefill_stats(),
-                            kv_transfer_params=kv_transfer_params,
-                            trace_headers=request.trace_headers,
-                            routed_experts=routed_experts,
-                            num_nans_in_logits=request.num_nans_in_logits,
-                            is_segment_finished=is_segment_finished,
-                            new_prompt_len_snapshot=self._new_prompt_len_snapshot.get(req_id, None),
-                        )
-                    )
-                    if self.chunk_transfer_adapter is not None:
-                        self.chunk_transfer_adapter.save_async(pooler_output, request)
+                # Capture finish_reason BEFORE _handle_stopped_request, which may
+                # reset the status to WAITING for streaming requests that continue.
+                finish_reason = request.get_finished_reason()
+                is_segment_finished = request.is_finished() and request.resumable
+                finished = self._handle_stopped_request(request)
+                if finished:
+                    kv_transfer_params = self._free_request(request)
+                if status_before_stop == RequestStatus.RUNNING:
+                    stopped_running_reqs.add(request)
+                elif status_before_stop == RequestStatus.WAITING_FOR_CHUNK:
+                    # In async chunk mode, request may be in either queue.
+                    # Remove from both to avoid stale queue entries.
+                    stopped_running_reqs.add(request)
+                    stopped_preempted_reqs.add(request)
                 else:
-                    # Invariant: EngineCore returns no partial prefill outputs.
-                    assert not prompt_logprobs_tensors
+                    stopped_preempted_reqs.add(request)
 
-            # Remove the stopped requests from the running and waiting queues.
-            if stopped_running_reqs:
-                self.running = remove_all(self.running, stopped_running_reqs)
-            if stopped_preempted_reqs:
-                # This is a rare case and unlikely to impact performance.
-                self.waiting.remove_requests(stopped_preempted_reqs)
-                self.skipped_waiting.remove_requests(stopped_preempted_reqs)
+            # Extract sample logprobs if needed.
+            if request.sampling_params is not None and request.sampling_params.logprobs is not None and logprobs:
+                new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
 
-            # [Main] Handle failed KV load requests
-            if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
-                requests = [self.requests[req_id] for req_id in failed_kv_load_req_ids]
-                self.finish_requests(failed_kv_load_req_ids, RequestStatus.FINISHED_ERROR)
-                for request in requests:
-                    outputs[request.client_index].append(
-                        EngineCoreOutput(
-                            request_id=request.request_id,
-                            new_token_ids=[],
-                            finish_reason=request.get_finished_reason(),
-                            events=request.take_events(),
-                            trace_headers=request.trace_headers,
-                        )
+            if num_nans_in_logits is not None and req_id in num_nans_in_logits:
+                request.num_nans_in_logits = num_nans_in_logits[req_id]
+
+            # Get prompt logprobs for this request.
+            prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
+            if new_token_ids or pooler_output is not None or kv_transfer_params or stopped:
+                # Add EngineCoreOutput for this Request.
+                # In async_chunk mode, GPU tensors flow via connector (CUDA IPC),
+                # not through EngineCoreOutput msgpack serialization.
+                # Strip pooling_output to avoid serializing GPU tensors.
+                orchestrator_pooling = (
+                    pooler_output if self.chunk_transfer_adapter is None else None
+                )
+                outputs[request.client_index].append(
+                    EngineCoreOutput(
+                        request_id=req_id,
+                        new_token_ids=new_token_ids,
+                        finish_reason=finish_reason,
+                        new_logprobs=new_logprobs,
+                        new_prompt_logprobs_tensors=prompt_logprobs_tensors,
+                        pooling_output=orchestrator_pooling,
+                        stop_reason=request.stop_reason,
+                        events=request.take_events(),
+                        prefill_stats=request.take_prefill_stats(),
+                        kv_transfer_params=kv_transfer_params,
+                        trace_headers=request.trace_headers,
+                        routed_experts=routed_experts,
+                        num_nans_in_logits=request.num_nans_in_logits,
+                        is_segment_finished=is_segment_finished,
+                        new_prompt_len_snapshot=self._new_prompt_len_snapshot.get(req_id, None),
                     )
-                    if self.chunk_transfer_adapter is not None:
-                        self.chunk_transfer_adapter.cleanup_receiver(
-                            request.request_id,
-                        )
+                )
+                if self.chunk_transfer_adapter is not None:
+                    self.chunk_transfer_adapter.save_async(pooler_output, request)
+            else:
+                # Invariant: EngineCore returns no partial prefill outputs.
+                assert not prompt_logprobs_tensors
 
-            # [Omni] Cleanup state for finished requests
-            for req in stopped_running_reqs:
-                if req.request_id not in self.waiting_for_transfer_free:
-                    if req.request_id in self.transfer_triggered_requests:
-                        self.transfer_triggered_requests.remove(req.request_id)
-                    if req.request_id in self.active_kv_transfers:
-                        self.active_kv_transfers.remove(req.request_id)
-                    self.pending_stop_after_extraction.discard(req.request_id)
+        # Remove the stopped requests from the running and waiting queues.
+        if stopped_running_reqs:
+            self.running = remove_all(self.running, stopped_running_reqs)
+        if stopped_preempted_reqs:
+            # This is a rare case and unlikely to impact performance.
+            self.waiting.remove_requests(stopped_preempted_reqs)
+            self.skipped_waiting.remove_requests(stopped_preempted_reqs)
 
-            # Same for preempted
-            for req in stopped_preempted_reqs:
-                if req.request_id not in self.waiting_for_transfer_free:
-                    if req.request_id in self.transfer_triggered_requests:
-                        self.transfer_triggered_requests.remove(req.request_id)
-                    if req.request_id in self.active_kv_transfers:
-                        self.active_kv_transfers.remove(req.request_id)
-                    self.pending_stop_after_extraction.discard(req.request_id)
+        # [Main] Handle failed KV load requests
+        if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
+            requests = [self.requests[req_id] for req_id in failed_kv_load_req_ids]
+            self.finish_requests(failed_kv_load_req_ids, RequestStatus.FINISHED_ERROR)
+            for request in requests:
+                outputs[request.client_index].append(
+                    EngineCoreOutput(
+                        request_id=request.request_id,
+                        new_token_ids=[],
+                        finish_reason=request.get_finished_reason(),
+                        events=request.take_events(),
+                        trace_headers=request.trace_headers,
+                    )
+                )
+                if self.chunk_transfer_adapter is not None:
+                    self.chunk_transfer_adapter.cleanup_receiver(
+                        request.request_id,
+                    )
 
-            # KV Connector: update state for finished KV Transfers.
-            if kv_connector_output:
-                self._update_from_kv_xfer_finished(kv_connector_output)
+        # [Omni] Cleanup state for finished requests
+        for req in stopped_running_reqs:
+            if req.request_id not in self.waiting_for_transfer_free:
+                if req.request_id in self.transfer_triggered_requests:
+                    self.transfer_triggered_requests.remove(req.request_id)
+                if req.request_id in self.active_kv_transfers:
+                    self.active_kv_transfers.remove(req.request_id)
+                self.pending_stop_after_extraction.discard(req.request_id)
 
-            # collect KV cache events from KV cache manager
-            events = self.kv_cache_manager.take_events()
+        # Same for preempted
+        for req in stopped_preempted_reqs:
+            if req.request_id not in self.waiting_for_transfer_free:
+                if req.request_id in self.transfer_triggered_requests:
+                    self.transfer_triggered_requests.remove(req.request_id)
+                if req.request_id in self.active_kv_transfers:
+                    self.active_kv_transfers.remove(req.request_id)
+                self.pending_stop_after_extraction.discard(req.request_id)
 
-            # collect KV cache events from connector
-            if self.connector is not None:
-                connector_events = self.connector.take_events()
-                if connector_events:
-                    if events is None:
-                        events = list(connector_events)
-                    else:
-                        events.extend(connector_events)
+        # KV Connector: update state for finished KV Transfers.
+        if kv_connector_output:
+            self._update_from_kv_xfer_finished(kv_connector_output)
 
-            # publish collected KV cache events
-            if events:
-                batch = KVEventBatch(ts=time(), events=events)
-                self.kv_event_publisher.publish(batch)
+        # collect KV cache events from KV cache manager
+        events = self.kv_cache_manager.take_events()
 
-            # Create EngineCoreOutputs for all clients that have requests with
-            # outputs in this step.
-            engine_core_outputs = {client_index: EngineCoreOutputs(outputs=outs) for client_index, outs in outputs.items()}
+        # collect KV cache events from connector
+        if self.connector is not None:
+            connector_events = self.connector.take_events()
+            if connector_events:
+                if events is None:
+                    events = list(connector_events)
+                else:
+                    events.extend(connector_events)
 
-            finished_req_ids = self.finished_req_ids_dict
-            if finished_req_ids:
-                # Include ids of requests that finished since last outputs
-                # were sent.
-                for client_index, finished_set in finished_req_ids.items():
-                    # Set finished request set in EngineCoreOutputs for this client.
-                    if (eco := engine_core_outputs.get(client_index)) is not None:
-                        eco.finished_requests = finished_set
-                    else:
-                        engine_core_outputs[client_index] = EngineCoreOutputs(finished_requests=finished_set)
-                finished_req_ids.clear()
+        # publish collected KV cache events
+        if events:
+            batch = KVEventBatch(ts=time(), events=events)
+            self.kv_event_publisher.publish(batch)
 
-            if (stats := self.make_stats(spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats)) is not None:
-                # Return stats to only one of the front-ends.
-                if (eco := next(iter(engine_core_outputs.values()), None)) is None:
-                    # We must return the stats even if there are no request
-                    # outputs this step.
-                    engine_core_outputs[0] = eco = EngineCoreOutputs()
-                eco.scheduler_stats = stats
+        # Create EngineCoreOutputs for all clients that have requests with
+        # outputs in this step.
+        engine_core_outputs = {client_index: EngineCoreOutputs(outputs=outs) for client_index, outs in outputs.items()}
 
-            # Free blocks that were held for transfer (kv_ready and
-            # active_kv_transfers updates already done before the per-request loop).
-            if kv_extracted_ids:
-                for req_id in kv_extracted_ids:
-                    try:
-                        if req_id in self.waiting_for_transfer_free:
-                            req = self.requests.get(req_id)
-                            if req:
-                                self.kv_cache_manager.free(req)
-                                if req_id in self.requests:
-                                    del self.requests[req_id]
-                                if req_id in self.transfer_triggered_requests:
-                                    self.transfer_triggered_requests.remove(req_id)
-                                self.active_kv_transfers.discard(req_id)
-                                self.pending_stop_after_extraction.discard(req_id)
-                                logger.debug(f"Freed blocks for {req_id} after transfer extraction")
-                            self.waiting_for_transfer_free.remove(req_id)
-                    except Exception:
-                        init_logger(__name__).exception("Failed to free blocks for %s after transfer", req_id)
+        finished_req_ids = self.finished_req_ids_dict
+        if finished_req_ids:
+            # Include ids of requests that finished since last outputs
+            # were sent.
+            for client_index, finished_set in finished_req_ids.items():
+                # Set finished request set in EngineCoreOutputs for this client.
+                if (eco := engine_core_outputs.get(client_index)) is not None:
+                    eco.finished_requests = finished_set
+                else:
+                    engine_core_outputs[client_index] = EngineCoreOutputs(finished_requests=finished_set)
+            finished_req_ids.clear()
+
+        if (stats := self.make_stats(spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats)) is not None:
+            # Return stats to only one of the front-ends.
+            if (eco := next(iter(engine_core_outputs.values()), None)) is None:
+                # We must return the stats even if there are no request
+                # outputs this step.
+                engine_core_outputs[0] = eco = EngineCoreOutputs()
+            eco.scheduler_stats = stats
+
+        # Free blocks that were held for transfer (kv_ready and
+        # active_kv_transfers updates already done before the per-request loop).
+        if kv_extracted_ids:
+            for req_id in kv_extracted_ids:
+                try:
+                    if req_id in self.waiting_for_transfer_free:
+                        req = self.requests.get(req_id)
+                        if req:
+                            self.kv_cache_manager.free(req)
+                            if req_id in self.requests:
+                                del self.requests[req_id]
+                            if req_id in self.transfer_triggered_requests:
+                                self.transfer_triggered_requests.remove(req_id)
+                            self.active_kv_transfers.discard(req_id)
+                            self.pending_stop_after_extraction.discard(req_id)
+                            logger.debug(f"Freed blocks for {req_id} after transfer extraction")
+                        self.waiting_for_transfer_free.remove(req_id)
+                except Exception:
+                    init_logger(__name__).exception("Failed to free blocks for %s after transfer", req_id)
 
         return engine_core_outputs
 

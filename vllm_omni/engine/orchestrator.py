@@ -181,6 +181,8 @@ class Orchestrator:
         self._fatal_error: str | None = None
         self._fatal_error_stage_id: int | None = None
 
+        self._gpu_transports: dict[tuple[str, str], Any] = {}
+
     async def run(self) -> None:
         """Main entry point for the Orchestrator event loop."""
         logger.info("[Orchestrator] Starting event loop")
@@ -1090,6 +1092,28 @@ class Orchestrator:
             sender_infos[sender_stage_id] = sender_info
 
         return sender_infos or None
+
+    # ---- GPU transport management ----
+
+    def set_gpu_transports(self, transports: dict[tuple[str, str], Any]) -> None:
+        """Register GPU transports for inter-stage tensor transfer."""
+        self._gpu_transports = transports or {}
+
+    def _cleanup_gpu_transports(self) -> None:
+        """Periodic cleanup of timed-out GPU transport tensors.
+
+        Should be called periodically (e.g. every N iterations or via a
+        background timer) to prevent tensor resource leaks in GPU transports
+        that implement ``cleanup_timeouts()``.
+        """
+        if not self._gpu_transports:
+            return
+        for transport in self._gpu_transports.values():
+            if hasattr(transport, "cleanup_timeouts"):
+                try:
+                    transport.cleanup_timeouts()
+                except Exception:
+                    logger.debug("gpu_transport cleanup_timeouts failed", exc_info=True)
 
     # ---- Shutdown / lifecycle ----
 

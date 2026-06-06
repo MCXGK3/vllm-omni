@@ -869,17 +869,17 @@ class NPUARModelRunner(OmniNPUModelRunner):
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
         needs_pooler_payload = len(downstream_req_ids) > 0
         downstream_req_id_set = set(downstream_req_ids)
-        hidden_states_cpu = None
-        req_hidden_states_cpu: dict[str, torch.Tensor] | None = None
+        hidden_states_gpu = None
+        req_hidden_states_gpu: dict[str, torch.Tensor] | None = None
         if needs_pooler_payload:
             num_valid_tokens = min(
                 int(scheduler_output.total_num_scheduled_tokens),
                 int(hidden_states.shape[0]),
             )
             if len(downstream_req_ids) == len(req_ids_output_copy):
-                hidden_states_cpu = hidden_states[:num_valid_tokens].detach().to("cpu").contiguous()
+                hidden_states_gpu = hidden_states[:num_valid_tokens].detach().contiguous()
             else:
-                req_hidden_states_cpu = {}
+                req_hidden_states_gpu = {}
         num_scheduled_tokens_np = getattr(self, "_omni_num_scheduled_tokens_np", None)
         if num_scheduled_tokens_np is None:
             req_ids = self.input_batch.req_ids
@@ -900,8 +900,18 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     multimodal_outputs,
                     scheduler_output.num_scheduled_tokens,
                 )
+                mm_gpu = {}
             else:
-                mm_cpu = build_mm_cpu(flatten_payload(multimodal_outputs))
+                multimodal_flat = flatten_payload(multimodal_outputs)
+                mm_gpu = {
+                    k: v for k, v in multimodal_flat.items()
+                    if k.startswith("hidden_states.")
+                }
+                mm_other = {
+                    k: v for k, v in multimodal_flat.items()
+                    if not k.startswith("hidden_states.")
+                }
+                mm_cpu = build_mm_cpu(mm_other)
 
             self._process_additional_information_updates(
                 hidden_states,
@@ -913,13 +923,13 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 req_ids_filter=downstream_req_id_set,
             )
 
-            if req_hidden_states_cpu is not None and combined_hidden_states is None:
+            if req_hidden_states_gpu is not None and combined_hidden_states is None:
                 for rid in downstream_req_ids:
                     idx = req_id_to_index_output_copy[rid]
                     start = int(query_start_loc_cpu[idx])
                     sched = int(num_scheduled_tokens_np[idx])
                     end = start + sched
-                    req_hidden_states_cpu[rid] = hidden_states[start:end].detach().to("cpu").contiguous()
+                    req_hidden_states_gpu[rid] = hidden_states[start:end].detach().contiguous()
 
             pooler_output = []
             for rid in req_ids_output_copy:
@@ -930,11 +940,11 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 start = int(query_start_loc_cpu[idx])
                 sched = int(num_scheduled_tokens_np[idx])
                 end = start + sched
-                if req_hidden_states_cpu is not None and combined_hidden_states is None:
-                    req_hidden_states = req_hidden_states_cpu[rid]
+                if req_hidden_states_gpu is not None and combined_hidden_states is None:
+                    req_hidden_states = req_hidden_states_gpu[rid]
                 else:
                     req_hidden_states = self._resolve_req_hidden_states(
-                        hidden_states_cpu,
+                        hidden_states_gpu,
                         combined_hidden_states,
                         rid,
                         start,
@@ -960,6 +970,18 @@ class NPUARModelRunner(OmniNPUModelRunner):
                                 pass_lists_through=False,
                                 seq_len=seq_len,
                             )
+                    payload.update(mm_payload)
+
+                if mm_gpu:
+                    for mm_key, mm_val in mm_gpu.items():
+                        mm_payload[mm_key] = to_payload_element(
+                            element=mm_val,
+                            idx=idx,
+                            start=start,
+                            end=end,
+                            pass_lists_through=False,
+                            seq_len=seq_len,
+                        )
                     payload.update(mm_payload)
                 pooler_output.append(flatten_payload(payload))
 

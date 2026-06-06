@@ -42,7 +42,6 @@ from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
-from vllm_omni.utils.nvtx import nvtx_range, nvtx_mark
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
@@ -301,7 +300,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         scheduler_output: SchedulerOutput,
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
-        nvtx_mark("omni:execute_model_start")
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
@@ -331,8 +329,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         data["custom_metadata"] = existing
                 except Exception as e:
                     logger.warning(f"Failed to get custom metadata from model for {req_id}: {e}")
-        
-        nvtx_mark("omni:handle_kv_transfer")
         self.kv_extracted_req_ids = self.kv_transfer_manager.handle_finished_requests_kv_transfer(
             finished_reqs=finished_reqs,
             kv_caches=self.kv_caches,
@@ -358,10 +354,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
-            nvtx_mark("omni_ar:preprocess_start")
             # Update persistent batch states.
-            with nvtx_range("omni_ar:update_states"):
-                deferred_state_corrections_fn = self._update_states(scheduler_output)
+            deferred_state_corrections_fn = self._update_states(scheduler_output)
 
             # Notify model of finished requests for state cleanup
             if scheduler_output.finished_req_ids and hasattr(self.model, "on_requests_finished"):
@@ -372,7 +366,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     scheduler_output,
                     encoder_cache=self.encoder_cache,
                 ) as ec_connector_output:
-                    nvtx_mark("omni_ar:encoder_forward")
                     self._execute_mm_encoder(scheduler_output)
 
                     kv_ids = self.kv_extracted_req_ids
@@ -383,6 +376,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         output = copy(output)
                         output.kv_extracted_req_ids = kv_ids
                     return output
+
             if not num_scheduled_tokens:
                 if (
                     self.parallel_config.distributed_executor_backend == "external_launcher"
@@ -395,6 +389,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 # would otherwise be silently overwritten next step.
                 kv_ids = self.kv_extracted_req_ids
                 self.kv_extracted_req_ids = None
+
                 if not has_kv_transfer_group():
                     output = EMPTY_MODEL_RUNNER_OUTPUT
                 else:
@@ -420,11 +415,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
-            with nvtx_range("omni_ar:prepare_inputs"):
-                logits_indices, spec_decode_metadata = self._prepare_inputs(
-                    scheduler_output,
-                    num_scheduled_tokens_np,
-                )
+            logits_indices, spec_decode_metadata = self._prepare_inputs(
+                scheduler_output,
+                num_scheduled_tokens_np,
+            )
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
@@ -476,33 +470,33 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 for id, spec in enumerate(self.kv_cache_config.kv_cache_groups)
                 if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
             )
-            with nvtx_range("omni_ar:_get_slot_mappings"):
-                slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
-                    num_tokens_padded=num_tokens_padded if pad_attn or has_separate_kv_update else num_tokens_unpadded,
-                    num_reqs_padded=(num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs),
-                    num_tokens_unpadded=num_tokens_unpadded,
-                    ubatch_slices=ubatch_slices_padded,
-                )
-            with nvtx_range("omni_ar:_build_attention_metadata"):
-                attn_metadata, spec_decode_common_attn_metadata = self._build_attention_metadata(
-                    num_tokens=num_tokens_unpadded,
-                    num_tokens_padded=num_tokens_padded if pad_attn else None,
-                    num_reqs=num_reqs,
-                    num_reqs_padded=num_reqs_padded if pad_attn else None,
-                    max_query_len=max_num_scheduled_tokens,
-                    ubatch_slices=ubatch_slices_attn,
-                    logits_indices=logits_indices,
-                    use_spec_decode=use_spec_decode,
-                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                    cascade_attn_prefix_lens=cascade_attn_prefix_lens,
-                    slot_mappings=slot_mappings_by_group,
-                )
-            with nvtx_range("omni_ar:_preprocess"):
-                (
-                    input_ids,
-                    inputs_embeds,
-                    positions,
-                    intermediate_tensors,
+
+            slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+                num_tokens_padded=num_tokens_padded if pad_attn or has_separate_kv_update else num_tokens_unpadded,
+                num_reqs_padded=(num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs),
+                num_tokens_unpadded=num_tokens_unpadded,
+                ubatch_slices=ubatch_slices_padded,
+            )
+
+            attn_metadata, spec_decode_common_attn_metadata = self._build_attention_metadata(
+                num_tokens=num_tokens_unpadded,
+                num_tokens_padded=num_tokens_padded if pad_attn else None,
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs_padded if pad_attn else None,
+                max_query_len=max_num_scheduled_tokens,
+                ubatch_slices=ubatch_slices_attn,
+                logits_indices=logits_indices,
+                use_spec_decode=use_spec_decode,
+                num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                slot_mappings=slot_mappings_by_group,
+            )
+
+            (
+                input_ids,
+                inputs_embeds,
+                positions,
+                intermediate_tensors,
                 model_kwargs,
                 ec_connector_output,
             ) = self._preprocess(scheduler_output, num_tokens_padded, intermediate_tensors)
@@ -545,7 +539,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,  # OMNI: required for KV cache operations
             ),
-            nvtx_range("omni_ar:forward"),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -878,17 +871,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
         needs_pooler_payload = len(downstream_req_ids) > 0
         downstream_req_id_set = set(downstream_req_ids)
-        hidden_states_cpu = None
-        req_hidden_states_cpu: dict[str, torch.Tensor] | None = None
+        hidden_states_gpu = None
+        req_hidden_states_gpu: dict[str, torch.Tensor] | None = None
         if needs_pooler_payload:
             num_valid_tokens = min(
                 int(scheduler_output.total_num_scheduled_tokens),
                 int(hidden_states.shape[0]),
             )
             if len(downstream_req_ids) == len(req_ids_output_copy):
-                hidden_states_cpu = hidden_states[:num_valid_tokens].detach().to("cpu").contiguous()
+                hidden_states_gpu = hidden_states[:num_valid_tokens].detach().contiguous()
             else:
-                req_hidden_states_cpu = {}
+                req_hidden_states_gpu = {}
         num_scheduled_tokens_np = getattr(self, "_omni_num_scheduled_tokens_np", None)
         if num_scheduled_tokens_np is None:
             req_ids = self.input_batch.req_ids
@@ -913,7 +906,20 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 )
             # Otherwise we don't have the mm CPU data yet, so we still need to build it
             if self.omni_prefix_cache is None:
-                mm_cpu = build_mm_cpu(flatten_payload(multimodal_outputs))
+                multimodal_flat = flatten_payload(multimodal_outputs)
+                # Keep hidden_states layers on GPU for CUDA IPC transport.
+                # build_mm_cpu would move them to CPU, defeating the purpose.
+                mm_gpu: dict[str, object] = {
+                    k: v for k, v in multimodal_flat.items()
+                    if k.startswith("hidden_states.")
+                }
+                mm_other = {
+                    k: v for k, v in multimodal_flat.items()
+                    if not k.startswith("hidden_states.")
+                }
+                mm_cpu = build_mm_cpu(mm_other)
+            else:
+                mm_gpu = {}
 
             self._process_additional_information_updates(
                 hidden_states,
@@ -925,13 +931,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 req_ids_filter=downstream_req_id_set,
             )
 
-            if req_hidden_states_cpu is not None and combined_hidden_states is None:
+            if req_hidden_states_gpu is not None and combined_hidden_states is None:
                 for rid in downstream_req_ids:
                     idx = req_id_to_index_output_copy[rid]
                     start = int(query_start_loc_cpu[idx])
                     sched = int(num_scheduled_tokens_np[idx])
                     end = start + sched
-                    req_hidden_states_cpu[rid] = hidden_states[start:end].detach().to("cpu").contiguous()
+                    req_hidden_states_gpu[rid] = hidden_states[start:end].detach().contiguous()
 
             pooler_output = []
             for rid in req_ids_output_copy:
@@ -942,13 +948,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 start = int(query_start_loc_cpu[idx])
                 sched = int(num_scheduled_tokens_np[idx])
                 end = start + sched
-                # If prefix cache is enabled, we have already split everything
-                # by request and converted the states to CPU tensors
-                if req_hidden_states_cpu is not None and combined_hidden_states is None:
-                    req_hidden_states = req_hidden_states_cpu[rid]
+                if req_hidden_states_gpu is not None and combined_hidden_states is None:
+                    req_hidden_states = req_hidden_states_gpu[rid]
                 else:
                     req_hidden_states = self._resolve_req_hidden_states(
-                        hidden_states_cpu,
+                        hidden_states_gpu,
                         combined_hidden_states,
                         rid,
                         start,
@@ -983,19 +987,22 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                                 seq_len=seq_len,
                             )
                     payload.update(mm_payload)
+
+                if mm_gpu:
+                    for mm_key, mm_val in mm_gpu.items():
+                        # Keep hidden_states layers on GPU — slice per-request.
+                        # to_payload_element handles tensor slicing; preserves device.
+                        mm_payload[mm_key] = to_payload_element(
+                            element=mm_val,
+                            idx=idx,
+                            start=start,
+                            end=end,
+                            pass_lists_through=False,
+                            seq_len=seq_len,
+                        )
+                    payload.update(mm_payload)
                 # Flatten nested dicts to dotted keys so pooling_output
                 # stays dict[str, torch.Tensor] for msgspec serialization.
-                # import pickle as _pkl                                                                                                                                                                                                
-                # import torch as _torch                                                                                                                                                                                               
-                # _payload_info = {}                                                                                                                                                                                                   
-                # for _k, _v in payload.items():                                                                                                                                                                                       
-                #     if isinstance(_v, _torch.Tensor):                                                                                                                                                                                
-                #         _payload_info[_k] = f"Tensor(shape={list(_v.shape)}, dtype={_v.dtype}, size={_v.element_size()*_v.numel()//1024}KB)"                                                                                         
-                #     else:                                                                                                                                                                                                            
-                #         _payload_info[_k] = type(_v).__name__                                                                                                                                                                        
-                # _total = len(_pkl.dumps(flatten_payload(payload)))                                                                                                                                                                   
-                # logger.warning("[Rank-%s] req=%s pooler_payload: %s | total_pickle=%sKB",                                                                                                                                            
-                #                 getattr(self, 'rank', '?'), rid, _payload_info, _total // 1024)
                 pooler_output.append(flatten_payload(payload))
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.routed_experts_initialized:

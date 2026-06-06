@@ -460,6 +460,28 @@ class AsyncOmniEngine:
         prompt_expand_func = None
         stage_plans: list[LogicalStageInitPlan] = []
 
+        # Initialize GPU transport ACK channels if GPU transport is configured
+        _ack_conns: dict[tuple[str, str], Any] = {}
+        _consumer_ack_conns: dict[tuple[str, str], Any] = {}
+        if (omni_transfer_config is not None
+                and getattr(omni_transfer_config, 'gpu_transport_config', None) is not None):
+            try:
+                from vllm_omni.distributed.gpu_transport.control_channel import ControlChannelPair
+
+                for edge_key in getattr(omni_transfer_config, 'connectors', {}):
+                    chan = ControlChannelPair()
+                    _ack_conns[edge_key] = chan.producer_conn
+                    _consumer_ack_conns[edge_key] = chan.consumer_conn
+                    logger.info(
+                        "[Orchestrator] Created ACK channel for edge %s->%s",
+                        edge_key[0], edge_key[1],
+                    )
+            except Exception:
+                logger.warning(
+                    "[Orchestrator] Failed to create GPU transport ACK channels",
+                    exc_info=True,
+                )
+
         for stage_idx, stage_cfg in enumerate(self.stage_configs):
             base_metadata = extract_stage_metadata(stage_cfg)
             configured_stage_id = base_metadata.stage_id
@@ -471,6 +493,23 @@ class AsyncOmniEngine:
                 stage_id=configured_stage_id,
                 async_chunk=self.async_chunk,
             )
+
+            # Inject GPU transport ACK pipe ends into connector spec
+            if stage_connector_spec and _ack_conns:
+                stage_id_str = str(configured_stage_id)
+                extra = stage_connector_spec.setdefault("extra", {})
+
+                # Find incoming edge (this stage is consumer, needs consumer_ack_conn)
+                for (from_s, to_s), conn in _consumer_ack_conns.items():
+                    if to_s == stage_id_str:
+                        extra["consumer_ack_conn"] = conn
+                        break
+
+                # Find outgoing edge (this stage is producer, needs ack_conn)
+                for (from_s, to_s), conn in _ack_conns.items():
+                    if from_s == stage_id_str:
+                        extra["ack_conn"] = conn
+                        break
             omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, configured_stage_id)
             num_replicas = replicas_per_stage[stage_idx]
             launch_mode = "local"
