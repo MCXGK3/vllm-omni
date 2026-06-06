@@ -77,16 +77,13 @@ class CudaIpcTransport:
             tensor = tensor.contiguous()
 
         tid = tensor_id or uuid.uuid4().hex[:12]
-        nbytes = tensor.numel() * tensor.element_size()
         t0 = time.perf_counter()
         torch.cuda.current_stream(tensor.device).synchronize()
-        sync_ms = (time.perf_counter() - t0) * 1000.0
-
         t1 = time.perf_counter()
-        ipc_args = extract_ipc_args(tensor)
-        extract_ms = (time.perf_counter() - t1) * 1000.0
 
+        ipc_args = extract_ipc_args(tensor)
         t2 = time.perf_counter()
+
         metadata = TensorMetadata.from_tensor(
             tensor,
             tensor_id=tid,
@@ -101,11 +98,12 @@ class CudaIpcTransport:
 
         self._registry.register(tid, tensor)
         self._ipc_args_store[tid] = ipc_args
-        register_ms = (time.perf_counter() - t2) * 1000.0
 
-        total_ms = (time.perf_counter() - t0) * 1000.0
-        logger.info("TIMING ipc_send id=%s nbytes=%d sync_ms=%.3f extract_ms=%.3f register_ms=%.3f total_ms=%.2f",
-                     tid, nbytes, sync_ms, extract_ms, register_ms, total_ms)
+        logger.debug(
+            "send: id=%s shape=%s dtype=%s nbytes=%d sync_ms=%.3f ipc_ms=%.3f",
+            tid, metadata.shape, metadata.dtype, metadata.nbytes,
+            (t1 - t0) * 1000, (t2 - t1) * 1000,
+        )
         return TransportHandle(tensor_id=tid, metadata=metadata)
 
     def recv(
@@ -127,23 +125,21 @@ class CudaIpcTransport:
         dst_dev = torch.device(dst_device) if isinstance(dst_device, str) else dst_device
         with torch.cuda.device(dst_dev):
             tensor = rebuild_from_ipc_args(ipc_args)
-        rebuild_ms = (time.perf_counter() - t0) * 1000.0
+        t1 = time.perf_counter()
 
-        nbytes = tensor.numel() * tensor.element_size()
-        logger.info("TIMING ipc_recv id=%s nbytes=%d rebuild_ms=%.3f",
-                     meta.tensor_id, nbytes, rebuild_ms)
+        logger.debug(
+            "recv: id=%s shape=%s dtype=%s rebuild_ms=%.3f",
+            meta.tensor_id, meta.shape, meta.dtype, (t1 - t0) * 1000,
+        )
         return tensor
 
     def _ack_loop(self) -> None:
         """Background daemon thread: poll ACK pipe and auto-release tensors."""
-        import time as _time
         from .control_channel import ProducerControl
         ctrl = ProducerControl(self._ack_conn)
         while self._ack_running:
             try:
-                _t0 = _time.perf_counter()
                 msg = ctrl.recv_ack(timeout_ms=500.0)
-                _poll_ms = (_time.perf_counter() - _t0) * 1000.0
             except Exception:
                 logger.exception("ack_thread: unexpected error in recv_ack")
                 continue
@@ -153,11 +149,8 @@ class CudaIpcTransport:
                 break
             tensor_id = msg.get("tensor_id", "")
             if tensor_id:
-                _t_rel = _time.perf_counter()
+                logger.debug("ack_thread: releasing id=%s", tensor_id)
                 self.release(tensor_id)
-                _rel_ms = (_time.perf_counter() - _t_rel) * 1000.0
-                logger.info("TIMING ack_recv id=%s poll_ms=%.3f release_ms=%.3f",
-                             tensor_id, _poll_ms, _rel_ms)
 
     def shutdown_ack_thread(self) -> None:
         """Signal the ACK thread to stop (does not join)."""
@@ -170,16 +163,13 @@ class CudaIpcTransport:
         from its TensorRegistry.  Safe to call multiple times (idempotent
         on the producer side).
         """
-        import time as _time
         if self._consumer_ack_conn is None:
             return
         try:
             from .control_channel import ConsumerControl
-            _t0 = _time.perf_counter()
             ctrl = ConsumerControl(self._consumer_ack_conn)
             ctrl.send_ack(tensor_id, ack_type="release")
-            _ack_ms = (_time.perf_counter() - _t0) * 1000.0
-            logger.info("TIMING ack_send id=%s ms=%.3f", tensor_id, _ack_ms)
+            logger.debug("notify_consumed: sent release ACK for id=%s", tensor_id)
         except Exception:
             logger.warning("notify_consumed: failed to send ACK for id=%s",
                            tensor_id, exc_info=True)

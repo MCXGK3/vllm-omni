@@ -62,7 +62,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
         self.requests_with_ready_chunks = set()
         self.requests_origin_status = {}
-        self._save_enqueue_ts: dict[str, float] = {}  # req_id → enqueue time
 
     @classmethod
     def create_connector(cls, model_config: Any):
@@ -124,7 +123,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             "is_finished": request.is_finished(),
         }
         self._pending_save_reqs.append(task)
-        self._save_enqueue_ts[request.external_req_id] = time.perf_counter()
         with self._save_cond:
             self._save_cond.notify()
 
@@ -155,7 +153,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if payload_data:
             # Update connector state
-            _t_proc = time.perf_counter()
             self.get_req_chunk[req_id] += 1
 
             meta = payload_data.get("meta", {})
@@ -194,10 +191,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
             # Mark as finished for consumption
             self._finished_load_reqs.add(req_id)
-            proc_ms = (time.perf_counter() - _t_proc) * 1000.0
-            logger.info(
-                "TIMING get stage=%s->%s req=%s chunk=%s size=%d get_ms=%.2f proc_ms=%.2f",
-                target_stage_id, stage_id, external_req_id, chunk_id, size, get_ms, proc_ms,
+            logger.debug(
+                "get stage=%s->%s req=%s chunk=%s size=%d get_ms=%.2f",
+                target_stage_id, stage_id, external_req_id, chunk_id, size, get_ms,
             )
             return True
 
@@ -239,14 +235,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         stage_id = self.connector.stage_id
         next_stage_id = stage_id + 1
         external_req_id = request.external_req_id
-        enqueue_ts = self._save_enqueue_ts.pop(external_req_id, None)
-        if enqueue_ts is not None:
-            queue_ms = (time.perf_counter() - enqueue_ts) * 1000.0
-            logger.info("TIMING queue_wait req=%s ms=%.2f", request.external_req_id, queue_ms)
         chunk_id = self.put_req_chunk[external_req_id]
         connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
         # Process payload in save_loop thread
-        _t_build = time.perf_counter()
         payload_data = None
         if self.custom_process_next_stage_input_func:
             try:
@@ -256,16 +247,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     request=request,
                     is_finished=is_finished,
                 )
-
             except Exception as e:
                 logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
 
         if not payload_data:
             return
-
-        _build_ms = (time.perf_counter() - _t_build) * 1000.0
-        logger.info("TIMING send_build_payload req=%s chunk=%s ms=%.2f",
-                     external_req_id, chunk_id, _build_ms)
 
         t0 = time.perf_counter()
         success, size, metadata = self.connector.put(
@@ -278,8 +264,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if success:
             self.put_req_chunk[external_req_id] += 1
-            logger.info(
-                "TIMING put stage=%s->%s req=%s chunk=%s size=%d put_ms=%.2f",
+            logger.debug(
+                "put stage=%s->%s req=%s chunk=%s size=%d put_ms=%.2f",
                 stage_id, next_stage_id, external_req_id, chunk_id, size, put_ms,
             )
             finished_flag = payload_data.get("meta", {}).get("finished", payload_data.get("finished"))
