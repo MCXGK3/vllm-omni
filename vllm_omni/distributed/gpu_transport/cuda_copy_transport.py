@@ -164,9 +164,13 @@ class CudaCopyTransport:
 
         tid = tensor_id or uuid.uuid4().hex[:12]
         t0 = time.perf_counter()
-        # NOTE: CUDA driver's cudaIpcGetMemHandle implicitly synchronizes.
+        stream = torch.cuda.current_stream(tensor.device)
+        event = torch.cuda.Event(blocking=False)
+        event.record(stream)
+        event.synchronize()
+        t1 = time.perf_counter()
         ipc_args = extract_ipc_args(tensor)
-        t1 = t2 = time.perf_counter()
+        t2 = time.perf_counter()
 
         metadata = TensorMetadata.from_tensor(
             tensor,

@@ -126,11 +126,18 @@ class CudaIpcTransport:
 
         tid = tensor_id or uuid.uuid4().hex[:12]
         t0 = time.perf_counter()
-        # NOTE: CUDA driver's cudaIpcGetMemHandle (called inside reduce_tensor)
-        # implicitly synchronizes all streams.  Explicit stream.synchronize()
-        # is redundant and prevents overlap between successive requests.
+        # Ensure the tensor's data is visible before we extract the IPC
+        # handle.  Use a CUDA event on the tensor's stream rather than
+        # a full device synchronize — this limits the stall to kernels
+        # queued on this specific stream and allows other streams to
+        # make progress concurrently.
+        stream = torch.cuda.current_stream(tensor.device)
+        event = torch.cuda.Event(blocking=False)
+        event.record(stream)
+        event.synchronize()
+        t1 = time.perf_counter()
         ipc_args = extract_ipc_args(tensor)
-        t1 = t2 = time.perf_counter()
+        t2 = time.perf_counter()
 
         metadata = TensorMetadata.from_tensor(
             tensor,
