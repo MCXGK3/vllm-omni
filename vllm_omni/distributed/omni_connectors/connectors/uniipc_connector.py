@@ -344,36 +344,40 @@ class UniIPCConnector(OmniConnectorBase):
             return None
 
     def release_gpu_tensors(self, request_id: str) -> None:
-        """Release GPU transport tensors for *request_id* via Pipe ACK.
-
-        Sends a ``notify_consumed`` ACK through the consumer→producer
-        Pipe for each tracked tensor.  The producer's ACK thread handles
-        the actual TensorRegistry release.  SHM segments are untouched.
-
-        Covers both sent tensors (``_pending_gpu_tensors``) and received
-        tensors (``_received_gpu_tensors``).
-        """
+        """Release GPU transport tensors for *request_id* via Pipe ACK."""
         prefix = f"{request_id}_"
         # Producer side: tensors sent via put()
-        keys = [k for k in list(self._pending_gpu_tensors) if k.startswith(prefix)]
-        for key in keys:
+        put_keys = [k for k in list(self._pending_gpu_tensors) if k.startswith(prefix)]
+        recv_keys = [k for k in list(self._received_gpu_tensors) if k.startswith(prefix)]
+        total_tids = sum(
+            len(self._pending_gpu_tensors.get(k, [])) for k in put_keys
+        ) + sum(
+            len(self._received_gpu_tensors.get(k, [])) for k in recv_keys
+        )
+        if total_tids:
+            logger.info(
+                "release_gpu_tensors: req=%s put_keys=%d recv_keys=%d total_tids=%d",
+                request_id, len(put_keys), len(recv_keys), total_tids,
+            )
+        for key in put_keys:
             for tid in self._pending_gpu_tensors.pop(key, []):
                 self.notify_gpu_tensor_consumed(tid)
-        # Consumer side: tensors received via get()
-        keys = [k for k in list(self._received_gpu_tensors) if k.startswith(prefix)]
-        for key in keys:
+        for key in recv_keys:
             for tid in self._received_gpu_tensors.pop(key, []):
                 self.notify_gpu_tensor_consumed(tid)
 
     def notify_gpu_tensor_consumed(self, tensor_id: str) -> None:
-        """Notify producer that a GPU tensor (cuda_ipc mode) is no longer needed.
-
-        Only meaningful for cuda_ipc mode where the consumer holds a zero-copy
-        view of the producer's GPU memory.  For cuda_copy mode the ACK is sent
-        automatically in recv().
-        """
+        """Notify producer that a GPU tensor (cuda_ipc mode) is no longer needed."""
         if self._transport is not None and hasattr(self._transport, 'notify_consumed'):
+            logger.info("notify_consumed: sending ACK for tensor_id=%s", tensor_id)
             self._transport.notify_consumed(tensor_id)
+        else:
+            logger.warning(
+                "notify_consumed: cannot send ACK for %s (transport=%s has_notify=%s)",
+                tensor_id,
+                self._transport is not None,
+                hasattr(self._transport, 'notify_consumed') if self._transport else False,
+            )
 
     def cleanup(self, request_id: str) -> None:
         """Clean SHM segments and release transport-held tensors."""
