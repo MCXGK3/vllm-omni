@@ -85,8 +85,12 @@ def split_gpu_tensors(
     transport: Any,
     router: Any = None,
     dst_device: str | None = None,
-) -> Any:
+) -> tuple[Any, list[str]]:
     """Walk *obj* and replace every CUDA tensor with a ``__gpux__`` marker.
+
+    Returns ``(stripped_obj, tensor_ids)`` where *tensor_ids* is a flat list
+    of all tensor IDs encountered during the walk.  Callers no longer need to
+    perform a second pass with ``_collect_tensor_ids``.
 
     If *router* is provided, it is called for each tensor and must return
     ``"inline"`` or ``"ipc"``.  ``"inline"`` serializes the tensor to CPU
@@ -99,9 +103,10 @@ def split_gpu_tensors(
         if router is not None:
             decision = router(obj)
             if decision == "inline":
-                return _make_inline_marker(
+                marker = _make_inline_marker(
                     obj, dst_device=dst_device or str(obj.device)
                 )
+                return marker, [marker["tensor_id"]]
         # Original IPC path
         handle = transport.send(obj, dst_rank=transport._config.dst_device)
         handle.metadata.ipc_args = transport._ipc_args_store[handle.tensor_id]
@@ -116,15 +121,26 @@ def split_gpu_tensors(
             handle.tensor_id,
             handle.metadata.shape,
         )
-        return marker
+        return marker, [handle.tensor_id]
 
     if isinstance(obj, dict):
-        return {k: split_gpu_tensors(v, transport, router=router, dst_device=dst_device) for k, v in obj.items()}
+        result: dict[str, Any] = {}
+        ids: list[str] = []
+        for k, v in obj.items():
+            result[k], sub_ids = split_gpu_tensors(v, transport, router=router, dst_device=dst_device)
+            ids.extend(sub_ids)
+        return result, ids
 
     if isinstance(obj, (list, tuple)):
-        return type(obj)(split_gpu_tensors(v, transport, router=router, dst_device=dst_device) for v in obj)
+        items: list[Any] = []
+        ids: list[str] = []
+        for v in obj:
+            item, sub_ids = split_gpu_tensors(v, transport, router=router, dst_device=dst_device)
+            items.append(item)
+            ids.extend(sub_ids)
+        return type(obj)(items), ids
 
-    return obj
+    return obj, []
 
 
 def reassemble_gpu_tensors(obj: Any, transport: Any) -> Any:

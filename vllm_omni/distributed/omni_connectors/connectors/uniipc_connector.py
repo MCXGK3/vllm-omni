@@ -212,20 +212,24 @@ class UniIPCConnector(OmniConnectorBase):
             return any(UniIPCConnector._has_gpu(v) for v in obj)
         return False
 
-    def _split(self, obj: Any) -> Any:
-        """Replace GPU tensors with ``__gpux__`` markers using the transport."""
+    def _split(self, obj: Any) -> tuple[Any, list[str]]:
+        """Replace GPU tensors with ``__gpux__`` markers using the transport.
+
+        Returns ``(stripped_obj, tensor_ids)`` — *tensor_ids* are collected
+        during the walk, avoiding a second traversal via ``_collect_tensor_ids``.
+        """
         if not self._has_gpu(obj):
-            return obj
+            return obj, []
         self._init_transport()
         from vllm_omni.distributed.gpu_transport.split import (
             split_gpu_tensors)
-        obj = split_gpu_tensors(
+        stripped, tensor_ids = split_gpu_tensors(
             obj, self._transport,
             router=self._route_tensor,
             dst_device=f"cuda:{self._dst_device}",
         )
         self._metrics["gpu_tensors_sent"] += 1
-        return obj
+        return stripped, tensor_ids
 
     def _reassemble(self, obj: Any) -> Any:
         """Replace ``__gpux__`` markers with real GPU tensors."""
@@ -283,12 +287,8 @@ class UniIPCConnector(OmniConnectorBase):
         timing = {}
         try:
             t_split_start = time.perf_counter()
-            stripped = self._split(data)
+            stripped, tensor_ids = self._split(data)
             timing["split_ms"] = (time.perf_counter() - t_split_start) * 1000.0
-            # Track GPU transport tensor_ids for per-request ACK
-            t_collect_start = time.perf_counter()
-            tensor_ids = self._collect_tensor_ids(stripped)
-            timing["collect_ids_ms"] = (time.perf_counter() - t_collect_start) * 1000.0
             if tensor_ids:
                 self._pending_gpu_tensors[put_key] = tensor_ids
             t_shm_start = time.perf_counter()
@@ -296,19 +296,17 @@ class UniIPCConnector(OmniConnectorBase):
                 from_stage, to_stage, put_key, stripped)
             timing["shm_put_ms"] = (time.perf_counter() - t_shm_start) * 1000.0
             if not success:
-                # SHM write failed — release GPU tensors already registered
-                # by _split(), otherwise they leak in the transport registry.
                 self._release_registered_tensors(put_key, tensor_ids)
                 return False, 0, None
             self._metrics["puts"] += 1
             self._metrics["bytes_transferred"] += size
             timing["put_total_ms"] = (time.perf_counter() - t0) * 1000.0
             self._metrics["put_total_ms"] += timing["put_total_ms"]
-            if self._has_gpu(data):
+            if tensor_ids:
                 logger.info(
-                    "TIMING put: key=%s total=%.3fms split=%.3fms collect=%.3fms shm=%.3fms size=%d",
+                    "TIMING put: key=%s total=%.3fms split=%.3fms shm=%.3fms size=%d num_tids=%d",
                     put_key, timing["put_total_ms"], timing["split_ms"],
-                    timing["collect_ids_ms"], timing["shm_put_ms"], size,
+                    timing["shm_put_ms"], size, len(tensor_ids or []),
                 )
             return True, size, metadata
         except Exception:

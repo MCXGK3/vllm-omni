@@ -126,11 +126,11 @@ class CudaIpcTransport:
 
         tid = tensor_id or uuid.uuid4().hex[:12]
         t0 = time.perf_counter()
-        torch.cuda.current_stream(tensor.device).synchronize()
-        t1 = time.perf_counter()
-
+        # NOTE: CUDA driver's cudaIpcGetMemHandle (called inside reduce_tensor)
+        # implicitly synchronizes all streams.  Explicit stream.synchronize()
+        # is redundant and prevents overlap between successive requests.
         ipc_args = extract_ipc_args(tensor)
-        t2 = time.perf_counter()
+        t1 = t2 = time.perf_counter()
 
         metadata = TensorMetadata.from_tensor(
             tensor,
@@ -148,9 +148,9 @@ class CudaIpcTransport:
         self._ipc_args_store[tid] = ipc_args
 
         logger.debug(
-            "send: id=%s shape=%s dtype=%s nbytes=%d sync_ms=%.3f ipc_ms=%.3f",
+            "send: id=%s shape=%s dtype=%s nbytes=%d ipc_ms=%.3f",
             tid, metadata.shape, metadata.dtype, metadata.nbytes,
-            (t1 - t0) * 1000, (t2 - t1) * 1000,
+            (t2 - t0) * 1000,
         )
         return TransportHandle(tensor_id=tid, metadata=metadata)
 
