@@ -2053,9 +2053,15 @@ class OmniConnectorModelRunnerMixin:
 
         spec = ConnectorSpec(name=name, extra=extra)
         try:
-            return OmniConnectorFactory.create_connector(spec)
+            connector = OmniConnectorFactory.create_connector(spec)
         except Exception as exc:
             raise RuntimeError(f"Failed to create connector {name}") from exc
+        # Remove Connection objects from extra so vLLM's config hash
+        # computation (which recursively walks extra) does not choke on
+        # unpicklable multiprocessing.Connection values.
+        extra.pop("ack_conn", None)
+        extra.pop("consumer_ack_conn", None)
+        return connector
 
     @staticmethod
     def _load_custom_func(model_config: Any) -> tuple[str | None, Any | None]:
