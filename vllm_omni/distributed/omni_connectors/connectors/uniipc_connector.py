@@ -280,14 +280,21 @@ class UniIPCConnector(OmniConnectorBase):
         """Split GPU tensors, delegate metadata to SHM connector."""
         t0 = time.perf_counter()
         tensor_ids = None
+        timing = {}
         try:
+            t_split_start = time.perf_counter()
             stripped = self._split(data)
+            timing["split_ms"] = (time.perf_counter() - t_split_start) * 1000.0
             # Track GPU transport tensor_ids for per-request ACK
+            t_collect_start = time.perf_counter()
             tensor_ids = self._collect_tensor_ids(stripped)
+            timing["collect_ids_ms"] = (time.perf_counter() - t_collect_start) * 1000.0
             if tensor_ids:
                 self._pending_gpu_tensors[put_key] = tensor_ids
+            t_shm_start = time.perf_counter()
             success, size, metadata = self._shm.put(
                 from_stage, to_stage, put_key, stripped)
+            timing["shm_put_ms"] = (time.perf_counter() - t_shm_start) * 1000.0
             if not success:
                 # SHM write failed — release GPU tensors already registered
                 # by _split(), otherwise they leak in the transport registry.
@@ -295,7 +302,14 @@ class UniIPCConnector(OmniConnectorBase):
                 return False, 0, None
             self._metrics["puts"] += 1
             self._metrics["bytes_transferred"] += size
-            self._metrics["put_total_ms"] += (time.perf_counter() - t0) * 1000.0
+            timing["put_total_ms"] = (time.perf_counter() - t0) * 1000.0
+            self._metrics["put_total_ms"] += timing["put_total_ms"]
+            if self._has_gpu(data):
+                logger.info(
+                    "TIMING put: key=%s total=%.3fms split=%.3fms collect=%.3fms shm=%.3fms size=%d",
+                    put_key, timing["put_total_ms"], timing["split_ms"],
+                    timing["collect_ids_ms"], timing["shm_put_ms"], size,
+                )
             return True, size, metadata
         except Exception:
             logger.exception("UniIPC put failed for key=%s", put_key)
@@ -329,22 +343,43 @@ class UniIPCConnector(OmniConnectorBase):
         for request completion.
         """
         t0 = time.perf_counter()
+        timing = {}
         try:
+            t_shm_start = time.perf_counter()
             result = self._shm.get(from_stage, to_stage, get_key, metadata)
+            timing["shm_get_ms"] = (time.perf_counter() - t_shm_start) * 1000.0
             if result is None:
                 return None
             obj, size = result
             # Collect GPU tensor IDs before reassembly replaces __gpux__
             # markers, then ACK immediately.
+            t_collect_start = time.perf_counter()
             tensor_ids = None
-            if self._has_markers(obj) and self._transport_mode == "cuda_ipc":
+            has_markers_flag = self._has_markers(obj)
+            if has_markers_flag and self._transport_mode == "cuda_ipc":
                 tensor_ids = self._collect_tensor_ids(obj)
+            timing["collect_ids_ms"] = (time.perf_counter() - t_collect_start) * 1000.0
+            t_reassemble_start = time.perf_counter()
             obj = self._reassemble(obj)
+            timing["reassemble_ms"] = (time.perf_counter() - t_reassemble_start) * 1000.0
             if tensor_ids:
+                t_ack_start = time.perf_counter()
                 for tid in tensor_ids:
                     self.notify_gpu_tensor_consumed(tid)
+                timing["ack_ms"] = (time.perf_counter() - t_ack_start) * 1000.0
+            else:
+                timing["ack_ms"] = 0.0
             self._metrics["gets"] += 1
-            self._metrics["get_total_ms"] += (time.perf_counter() - t0) * 1000.0
+            timing["get_total_ms"] = (time.perf_counter() - t0) * 1000.0
+            self._metrics["get_total_ms"] += timing["get_total_ms"]
+            if has_markers_flag:
+                logger.info(
+                    "TIMING get: key=%s total=%.3fms shm=%.3fms collect=%.3fms "
+                    "reassemble=%.3fms ack=%.3fms",
+                    get_key, timing["get_total_ms"], timing["shm_get_ms"],
+                    timing["collect_ids_ms"], timing["reassemble_ms"],
+                    timing["ack_ms"],
+                )
             return obj, size
         except Exception:
             logger.exception("UniIPC get failed for key=%s", get_key)
