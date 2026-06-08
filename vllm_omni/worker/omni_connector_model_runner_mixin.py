@@ -1351,18 +1351,14 @@ class OmniConnectorModelRunnerMixin:
             else:
                 fanout_packet = None
 
-            if self.is_data_transfer_rank():                                                                                                                          
-                  import pickle, time                                                                                                                                   
-                  t0 = time.time()                                                                                                                                      
-                  try:                                                                                                                                                  
-                      pkl_size = len(pickle.dumps(fanout_packet))                                                                                                       
-                  except Exception:                                                                                                                                     
-                      pkl_size = -1                                                                                                                                     
-                  elapsed = time.time() - t0                                                                                                                            
-                  logger.warning(                                                                                                                                       
-                      "[Stage-%s] TP BCAST fanout_packet is_none=%s pickle_size=%s pickle_time_ms=%.1f",                                                                
-                      self._stage_id, fanout_packet is None, pkl_size, elapsed * 1000,                                                                                  
-                  )
+            if self.is_data_transfer_rank():
+                if fanout_packet is not None:
+                    staged_keys = len(fanout_packet.get("staged_payloads", ()))
+                    meta_keys = len(fanout_packet.get("request_metadata", ()))
+                    logger.warning(
+                        "[Stage-%s] TP BCAST fanout_packet staged_payloads=%d request_metadata=%d",
+                        self._stage_id, staged_keys, meta_keys,
+                    )
             fanout_packet = self._broadcast_tp_payload_packet(fanout_packet)
             if fanout_packet is None:
                 newly_finished = set()
