@@ -80,6 +80,23 @@ class OmniConnectorModelRunnerMixin:
             kv_transfer_manager: Existing KV transfer manager to delegate to.
         """
         self._omni_connector: OmniConnectorBase | None = self._create_connector(model_config)
+        # Outbound connector always uses SharedMemoryConnector so that
+        # downstream stages that are not configured with UniIPC receive
+        # plain serialized payloads instead of __gpux__ markers.
+        if self._omni_connector is not None:
+            try:
+                from vllm_omni.distributed.omni_connectors.connectors.shm_connector import (
+                    SharedMemoryConnector,
+                )
+                self._omni_send_connector: OmniConnectorBase | None = (
+                    SharedMemoryConnector({
+                        "stage_id": self._omni_connector.stage_id,
+                    })
+                )
+            except Exception:
+                self._omni_send_connector = None
+        else:
+            self._omni_send_connector = None
         self._kv_transfer_manager = kv_transfer_manager
 
         self._async_chunk: bool = getattr(model_config, "async_chunk", False)
@@ -200,6 +217,11 @@ class OmniConnectorModelRunnerMixin:
         if self._omni_connector is not None:
             try:
                 self._omni_connector.close()
+            except Exception:
+                pass
+        if getattr(self, "_omni_send_connector", None) is not None:
+            try:
+                self._omni_send_connector.close()
             except Exception:
                 pass
 
@@ -1780,7 +1802,10 @@ class OmniConnectorModelRunnerMixin:
         ``success=False``), returns False **without** decrementing
         ``_pending_save_counts`` so the caller can retry or clean up.
         """
-        connector = self._omni_connector
+        # Use the outbound (SHM-only) connector so downstream stages that
+        # do not use UniIPC receive plain serialized payloads, not __gpux__
+        # markers that they cannot reassemble.
+        connector = getattr(self, "_omni_send_connector", None) or self._omni_connector
         if connector is None:
             return True
 
