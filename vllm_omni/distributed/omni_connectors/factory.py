@@ -43,11 +43,33 @@ class OmniConnectorFactory:
         constructor = cls._registry[spec.name]
         try:
             connector = constructor(spec.extra)
-            logger.info(f"Created connector: {spec.name}")
-            return connector
         except Exception as e:
             logger.error(f"Failed to create connector {spec.name}: {e}")
             raise ValueError(f"Failed to create connector {spec.name}: {e}")
+        # Wire ACK pipes that were stripped from extra before vLLM
+        # config hash computation (see async_omni_engine.py).
+        extra = getattr(spec, "extra", {}) or {}
+        stage_id = int(extra.get("stage_id", -1))
+        if stage_id >= 0 and hasattr(connector, "set_ack_conns"):
+            try:
+                from vllm_omni.engine.async_omni_engine import _STAGE_ACK_PIPES
+                pipes = _STAGE_ACK_PIPES.get(stage_id, {})
+                ack_conn = pipes.get("ack_conn")
+                consumer_ack_conn = pipes.get("consumer_ack_conn")
+                if ack_conn or consumer_ack_conn:
+                    connector.set_ack_conns(ack_conn, consumer_ack_conn)
+                    logger.info(
+                        "[Stage-%s] Wired ACK pipes to %s (ack=%s, consumer_ack=%s)",
+                        stage_id, spec.name, ack_conn is not None,
+                        consumer_ack_conn is not None,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "[Stage-%s] Failed to wire ACK pipes to %s: %s",
+                    stage_id, spec.name, e,
+                )
+        logger.info(f"Created connector: {spec.name}")
+        return connector
 
     @classmethod
     def list_registered_connectors(cls) -> list[str]:
