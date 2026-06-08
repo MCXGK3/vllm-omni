@@ -46,8 +46,9 @@ class OmniConnectorFactory:
         except Exception as e:
             logger.error(f"Failed to create connector {spec.name}: {e}")
             raise ValueError(f"Failed to create connector {spec.name}: {e}")
-        # Wire ACK pipes that were stripped from extra before vLLM
-        # config hash computation (see async_omni_engine.py).
+        # Wire ACK pipes passed through process spawn kwargs.
+        # Saved to _WORKER_ACK_PIPES by run_stage_core before any
+        # connectors are created.
         extra = getattr(spec, "extra", {}) or {}
         stage_id = int(extra.get("stage_id", -1))
         has_setter = hasattr(connector, "set_ack_conns")
@@ -58,15 +59,12 @@ class OmniConnectorFactory:
         )
         if stage_id >= 0 and has_setter:
             try:
-                # Use class-level dict on UniIPCConnector — survives fork
-                # where module-level variables are reset on re-import.
-                from vllm_omni.distributed.omni_connectors.connectors.uniipc_connector import \
-                    UniIPCConnector as _UIPC
-                pipes = _UIPC._stage_ack_pipes.get(stage_id, {})
+                from vllm_omni.engine.stage_engine_core_proc import _WORKER_ACK_PIPES
+                pipes = _WORKER_ACK_PIPES.get(stage_id, {})
                 ack_conn = pipes.get("ack_conn")
                 consumer_ack_conn = pipes.get("consumer_ack_conn")
                 logger.info(
-                    "[Stage-%s] _stage_ack_pipes entry: ack=%s consumer_ack=%s",
+                    "[Stage-%s] _WORKER_ACK_PIPES entry: ack=%s consumer_ack=%s",
                     stage_id, ack_conn is not None, consumer_ack_conn is not None,
                 )
                 if ack_conn or consumer_ack_conn:

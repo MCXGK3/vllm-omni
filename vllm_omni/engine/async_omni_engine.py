@@ -771,10 +771,15 @@ class AsyncOmniEngine:
                                     )
                                 )
                             else:
+                                stage_ack = UniIPCConnector._stage_ack_pipes.get(
+                                    plan.metadata.stage_id, {}
+                                )
+                                stage_ack["stage_id"] = plan.metadata.stage_id
                                 addresses, proc, handshake_address = spawn_stage_core(
                                     vllm_config=vllm_config,
                                     executor_class=executor_class,
                                     log_stats=True,
+                                    ack_pipes=stage_ack if any(stage_ack.values()) else None,
                                 )
                             logger.info(
                                 "[AsyncOmniEngine] Stage %s engine launch started",
