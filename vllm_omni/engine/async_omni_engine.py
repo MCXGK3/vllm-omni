@@ -521,13 +521,29 @@ class AsyncOmniEngine:
                 for (from_s, to_s), conn in _consumer_ack_conns.items():
                     if to_s == stage_id_str:
                         extra["consumer_ack_conn"] = conn
+                        logger.info(
+                            "[Orchestrator] Injected consumer_ack_conn for stage %s (edge %s->%s)",
+                            stage_id_str, from_s, to_s,
+                        )
                         break
 
                 # Find outgoing edge (this stage is producer, needs ack_conn)
                 for (from_s, to_s), conn in _ack_conns.items():
                     if from_s == stage_id_str:
                         extra["ack_conn"] = conn
+                        logger.info(
+                            "[Orchestrator] Injected ack_conn for stage %s (edge %s->%s)",
+                            stage_id_str, from_s, to_s,
+                        )
                         break
+                logger.info(
+                    "[Orchestrator] Stage-%s ACK inject done: _ack_conns=%s _consumer_ack_conns=%s extra_has_ack=%s extra_has_consumer_ack=%s",
+                    stage_id_str,
+                    list(_ack_conns.keys()),
+                    list(_consumer_ack_conns.keys()),
+                    "ack_conn" in extra,
+                    "consumer_ack_conn" in extra,
+                )
             # Override GPU transport mode from CLI when --gpu-tensor-transport
             # is explicitly set (default "none" = no override).
             if self._gpu_tensor_transport != "none" and stage_connector_spec:
@@ -538,10 +554,17 @@ class AsyncOmniEngine:
             # forked so a module-level dict can bridge the gap.
             if stage_connector_spec:
                 extra = stage_connector_spec.get("extra", {})
-                _STAGE_ACK_PIPES[configured_stage_id] = {
+                saved = {
                     "ack_conn": extra.pop("ack_conn", None),
                     "consumer_ack_conn": extra.pop("consumer_ack_conn", None),
                 }
+                _STAGE_ACK_PIPES[configured_stage_id] = saved
+                logger.info(
+                    "[Orchestrator] Stage-%d saved ACK pipes: ack=%s consumer_ack=%s",
+                    configured_stage_id,
+                    saved["ack_conn"] is not None,
+                    saved["consumer_ack_conn"] is not None,
+                )
             omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, configured_stage_id)
             num_replicas = replicas_per_stage[stage_idx]
             launch_mode = "local"
