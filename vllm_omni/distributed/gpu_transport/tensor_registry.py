@@ -36,7 +36,7 @@ class TensorRegistry:
             }
             total = sum(e["nbytes"] for e in self._entries.values())
             count = len(self._entries)
-            logger.info("registry: +%s nbytes=%d size=%d total_bytes=%d",
+            logger.debug("registry: +%s nbytes=%d size=%d total_bytes=%d",
                          tensor_id, nbytes, count, total)
             # Log potential OOM every 512MB accumulated or at size milestones
             if total > 512 * 1024 * 1024 and total % (512 * 1024 * 1024) < nbytes:
