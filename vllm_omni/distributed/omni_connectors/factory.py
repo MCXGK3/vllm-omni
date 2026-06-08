@@ -50,25 +50,33 @@ class OmniConnectorFactory:
         # config hash computation (see async_omni_engine.py).
         extra = getattr(spec, "extra", {}) or {}
         stage_id = int(extra.get("stage_id", -1))
-        if stage_id >= 0 and hasattr(connector, "set_ack_conns"):
+        has_setter = hasattr(connector, "set_ack_conns")
+        logger.info(
+            "Created connector: %s (stage_id=%d has_set_ack=%s extra_keys=%s)",
+            spec.name, stage_id, has_setter,
+            list(extra.keys()) if extra else [],
+        )
+        if stage_id >= 0 and has_setter:
             try:
                 from vllm_omni.engine.async_omni_engine import _STAGE_ACK_PIPES
                 pipes = _STAGE_ACK_PIPES.get(stage_id, {})
                 ack_conn = pipes.get("ack_conn")
                 consumer_ack_conn = pipes.get("consumer_ack_conn")
+                logger.info(
+                    "[Stage-%s] _STAGE_ACK_PIPES entry: ack=%s consumer_ack=%s",
+                    stage_id, ack_conn is not None, consumer_ack_conn is not None,
+                )
                 if ack_conn or consumer_ack_conn:
                     connector.set_ack_conns(ack_conn, consumer_ack_conn)
                     logger.info(
-                        "[Stage-%s] Wired ACK pipes to %s (ack=%s, consumer_ack=%s)",
-                        stage_id, spec.name, ack_conn is not None,
-                        consumer_ack_conn is not None,
+                        "[Stage-%s] Wired ACK pipes to %s",
+                        stage_id, spec.name,
                     )
             except Exception as e:
                 logger.warning(
                     "[Stage-%s] Failed to wire ACK pipes to %s: %s",
                     stage_id, spec.name, e,
                 )
-        logger.info(f"Created connector: {spec.name}")
         return connector
 
     @classmethod
