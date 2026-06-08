@@ -271,6 +271,31 @@ class OmniConnectorModelRunnerMixin:
             self._send_side_request_payload.pop(ext_id, None)
         self._send_side_request_payload.pop(req_id, None)
 
+    def _cleanup_gpu_transport_timeouts(self) -> None:
+        """Release GPU transport tensors whose ACK never arrived.
+
+        Called periodically from the recv loop to protect producer-side
+        registries when a consumer exits or a release ACK is lost.
+        Only meaningful when ``release_timeout_ms > 0`` on the transport.
+        """
+        conn = self._omni_connector
+        if conn is None:
+            return
+        transport = getattr(conn, "_transport", None)
+        if transport is not None and hasattr(transport, "cleanup_timeouts"):
+            try:
+                released = transport.cleanup_timeouts()
+                if released:
+                    logger.warning(
+                        "[Stage-%s] GPU transport timeout cleanup: released %d tensors: %s",
+                        self._stage_id, len(released), released,
+                    )
+            except Exception:
+                logger.debug(
+                    "[Stage-%s] GPU transport timeout cleanup failed",
+                    self._stage_id, exc_info=True,
+                )
+
     def _cleanup_recv_delivery_state(self, req_id: str) -> None:
         """Clear recv-side delivery-cycle state."""
         if hasattr(self, "_lock"):
@@ -1509,6 +1534,9 @@ class OmniConnectorModelRunnerMixin:
                     pending_ids[:5],
                     _recv_poll_count,
                 )
+                # Periodic GPU transport timeout cleanup: release tensors
+                # whose ACK never arrived (e.g. consumer process exited).
+                self._cleanup_gpu_transport_timeouts()
 
             made_progress = False
             for req_id in pending_ids:
