@@ -225,16 +225,23 @@ class OmniConnectorModelRunnerMixin:
             self._kv_active_transfers.discard(req_id)
             self._kv_completed_transfers.discard(req_id)
             self._kv_triggered_requests.discard(req_id)
+        # ACK GPU IPC tensors to release producer-side TensorRegistry entries
+        if self._omni_connector is not None:
+            self._omni_connector.release_gpu_tensors(send_req_id)
         self._cleanup_recv_delivery_state(req_id)
 
     def drop_inactive_request_delivery_state(self, req_id: str) -> None:
         """Clear recv-side state for inactive requests."""
         ext_id = self._request_ids_mapping.pop(req_id, None)
+        drop_key = ext_id if ext_id is not None else req_id
         if hasattr(self, "_lock"):
             with self._lock:
                 self._drop_send_side_payload_state(req_id, ext_id)
         else:
             self._drop_send_side_payload_state(req_id, ext_id)
+        # ACK GPU IPC tensors to release producer-side TensorRegistry entries
+        if self._omni_connector is not None:
+            self._omni_connector.release_gpu_tensors(drop_key)
         self._cleanup_recv_delivery_state(req_id)
 
     def _drop_send_side_payload_state(self, req_id: str, ext_id: str | None) -> None:

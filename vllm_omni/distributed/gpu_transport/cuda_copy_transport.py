@@ -51,11 +51,41 @@ class CudaCopyTransport:
                 if i == j:
                     continue
                 try:
-                    if not torch.cuda.can_device_access_peer(i, j):
+                    if torch.cuda.can_device_access_peer(i, j):
                         torch.cuda.device(i).enable_peer_access(j)
                 except Exception as e:
                     logger.warning(
                         "Failed to enable P2P access device %d -> %d: %s", i, j, e)
+
+    @staticmethod
+    def _resolve_local_ordinals(
+        src_physical: int, dst_dev: torch.device,
+    ) -> tuple[int | None, int | None]:
+        """Map physical GPU indices to local device ordinals.
+
+        When CUDA_VISIBLE_DEVICES remaps GPUs in a consumer process the
+        physical indices stored in config no longer match local ordinals.
+        Each element is ``None`` when the corresponding device is not
+        locally visible.
+        """
+        def _resolve_one(physical_idx: int) -> int | None:
+            try:
+                dev = torch.device(f"cuda:{physical_idx}")
+                with torch.cuda.device(dev):
+                    pass
+                return dev.index
+            except (RuntimeError, torch.AcceleratorError):
+                return None
+
+        src_local = _resolve_one(src_physical)
+        # dst_dev may already carry a remapped ordinal; validate it
+        try:
+            with torch.cuda.device(dst_dev):
+                pass
+            dst_local = dst_dev.index
+        except (RuntimeError, torch.AcceleratorError):
+            dst_local = None
+        return src_local, dst_local
 
     def _start_ack_thread(self) -> None:
         """Start the ACK thread if ack_conn is set. Idempotent."""
@@ -132,16 +162,21 @@ class CudaCopyTransport:
 
         dst_dev = torch.device(dst_device) if isinstance(dst_device, str) else dst_device
 
+        # Resolve both source and destination to local device ordinals.
+        # In deployments with CUDA_VISIBLE_DEVICES remapping the physical
+        # GPU indices stored in config do not match local ordinals.
+        src_local, dst_local = self._resolve_local_ordinals(self._config.src_device, dst_dev)
+
         # Check P2P capability (skip for same-device, device can always access itself)
-        if self._config.src_device != dst_dev.index:
+        if src_local is not None and src_local != dst_local:
             try:
-                has_peer = torch.cuda.can_device_access_peer(self._config.src_device, dst_dev.index)
+                has_peer = torch.cuda.can_device_access_peer(src_local, dst_local)
             except (RuntimeError, AssertionError):
                 has_peer = False
             if not has_peer:
                 raise RuntimeError(
-                    f"P2P access not available from device {self._config.src_device} "
-                    f"to {dst_dev}. Enable peer access or use cuda_ipc mode instead."
+                    f"P2P access not available from device {src_local} "
+                    f"to {dst_local}. Enable peer access or use cuda_ipc mode instead."
                 )
 
         t0 = time.perf_counter()

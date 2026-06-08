@@ -49,7 +49,7 @@ class CudaIpcTransport:
                 if i == j:
                     continue
                 try:
-                    if not torch.cuda.can_device_access_peer(i, j):
+                    if torch.cuda.can_device_access_peer(i, j):
                         torch.cuda.device(i).enable_peer_access(j)
                 except Exception as e:
                     logger.warning(

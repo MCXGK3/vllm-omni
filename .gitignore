@@ -162,7 +162,7 @@ TASK.md
 /.claude/
 .claude/
 docs/superpowers/
-
+.superpowers/
 # Codex
 AGENTS.md
 .codex

@@ -79,6 +79,10 @@ class UniIPCConnector(OmniConnectorBase):
         # Key: put_key (e.g. "req-123_0_0"), Value: list of tensor_id strings.
         self._pending_gpu_tensors: dict[str, list[str]] = {}
 
+        # Track GPU transport tensor_ids received via get() for per-request ACK.
+        # Key: get_key, Value: list of tensor_id strings.
+        self._received_gpu_tensors: dict[str, list[str]] = {}
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -221,9 +225,6 @@ class UniIPCConnector(OmniConnectorBase):
 
     def _reassemble(self, obj: Any) -> Any:
         """Replace ``__gpux__`` markers with real GPU tensors."""
-        if not isinstance(obj, dict):
-            return obj
-        # Check for __gpux__ markers without importing from split
         if not self._has_markers(obj):
             return obj
         self._init_transport()
@@ -306,6 +307,12 @@ class UniIPCConnector(OmniConnectorBase):
             if result is None:
                 return None
             obj, size = result
+            # Track GPU tensor IDs before reassembly replaces markers,
+            # so they can be ACKed later via release_gpu_tensors().
+            if self._has_markers(obj) and self._transport_mode == "cuda_ipc":
+                tensor_ids = self._collect_tensor_ids(obj)
+                if tensor_ids:
+                    self._received_gpu_tensors[get_key] = tensor_ids
             obj = self._reassemble(obj)
             self._metrics["gets"] += 1
             self._metrics["get_total_ms"] += (time.perf_counter() - t0) * 1000.0
@@ -320,11 +327,20 @@ class UniIPCConnector(OmniConnectorBase):
         Sends a ``notify_consumed`` ACK through the consumer→producer
         Pipe for each tracked tensor.  The producer's ACK thread handles
         the actual TensorRegistry release.  SHM segments are untouched.
+
+        Covers both sent tensors (``_pending_gpu_tensors``) and received
+        tensors (``_received_gpu_tensors``).
         """
         prefix = f"{request_id}_"
+        # Producer side: tensors sent via put()
         keys = [k for k in list(self._pending_gpu_tensors) if k.startswith(prefix)]
         for key in keys:
             for tid in self._pending_gpu_tensors.pop(key, []):
+                self.notify_gpu_tensor_consumed(tid)
+        # Consumer side: tensors received via get()
+        keys = [k for k in list(self._received_gpu_tensors) if k.startswith(prefix)]
+        for key in keys:
+            for tid in self._received_gpu_tensors.pop(key, []):
                 self.notify_gpu_tensor_consumed(tid)
 
     def notify_gpu_tensor_consumed(self, tensor_id: str) -> None:
@@ -344,10 +360,22 @@ class UniIPCConnector(OmniConnectorBase):
 
     def close(self) -> None:
         """Release SHM connector and GPU transport."""
+        # Release all tracked GPU tensors before closing transport
+        for key in list(self._pending_gpu_tensors):
+            for tid in self._pending_gpu_tensors.pop(key, []):
+                self.notify_gpu_tensor_consumed(tid)
+        for key in list(self._received_gpu_tensors):
+            for tid in self._received_gpu_tensors.pop(key, []):
+                self.notify_gpu_tensor_consumed(tid)
         self._shm.close()
         if self._transport is not None:
             self._transport.close()
             self._transport = None
+
+    @property
+    def dst_device(self) -> str:
+        """Configured destination GPU device string (e.g. ``cuda:7``)."""
+        return f"cuda:{self._dst_device}"
 
     def health(self) -> dict[str, Any]:
         result = {

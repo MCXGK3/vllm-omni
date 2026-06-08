@@ -295,6 +295,7 @@ class AsyncOmniEngine:
         self.num_stages = len(self.stage_configs)
         stage0_args = getattr(self.stage_configs[0], "engine_args", None) if self.num_stages > 0 else None
         self.async_chunk = bool(getattr(stage0_args, "async_chunk", False))
+        self._gpu_tensor_transport: str = kwargs.get("gpu_tensor_transport", "none")
         self.stage_pools: list[StagePool] = []
         self.stage_clients: list[Any] = []  # logical-stage view for external readers
         self.input_processor: InputProcessor | None = None
@@ -510,6 +511,11 @@ class AsyncOmniEngine:
                     if from_s == stage_id_str:
                         extra["ack_conn"] = conn
                         break
+            # Override GPU transport mode from CLI when --gpu-tensor-transport
+            # is explicitly set (default "none" = no override).
+            if self._gpu_tensor_transport != "none" and stage_connector_spec:
+                extra = stage_connector_spec.setdefault("extra", {})
+                extra["gpu_transport_mode"] = self._gpu_tensor_transport
             omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, configured_stage_id)
             num_replicas = replicas_per_stage[stage_idx]
             launch_mode = "local"

@@ -39,7 +39,7 @@ def _layer_tensor(layers: dict[Any, Any], key: str) -> torch.Tensor | None:
     return val if isinstance(val, torch.Tensor) else None
 
 
-def _reconstruct_ipc_tensor(data: Any, dst_device: str = "cuda:7") -> torch.Tensor | None:
+def _reconstruct_ipc_tensor(data: Any, dst_device: str) -> torch.Tensor | None:
     """If *data* is a ``__gpux__`` IPC marker dict, rebuild the GPU tensor.
 
     Returns the reconstructed GPU tensor, or None if *data* is not an IPC marker.
@@ -323,8 +323,12 @@ def thinker2talker_async_chunk(
     thinker_emb = _layer_tensor(thinker_layers, _EMBED_LAYER_KEY)
     thinker_hid = _layer_tensor(thinker_layers, _HIDDEN_LAYER_KEY)
 
-    # If the engine exported these via CUDA IPC, reconstruct GPU tensors.
-    _dst = "cuda:7"  # talker GPU
+    # If the engine exported these via CUDA IPC, reconstruct GPU tensors
+    # on the talker GPU configured in the connector.
+    _conn = getattr(transfer_manager, 'connector', None)
+    _dst = getattr(_conn, 'dst_device', None) if _conn is not None else None
+    if _dst is None:
+        _dst = f"cuda:{getattr(_conn, '_dst_device', 0)}" if _conn is not None else "cuda:0"
     if thinker_emb is None:
         _raw = thinker_layers.get(int(_EMBED_LAYER_KEY)) or thinker_layers.get(_EMBED_LAYER_KEY)
         thinker_emb = _reconstruct_ipc_tensor(_raw, dst_device=_dst)

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import multiprocessing as mp
+import os
 import sys
 import time
 import types
@@ -25,7 +26,10 @@ from multiprocessing import Pipe
 # its dependencies are mismatched, e.g. an incompatible transformers version).
 # ---------------------------------------------------------------------------
 
-_VLLM_OMNI_BASE = "/home/multimodal/vllm-omni/vllm_omni"
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+# tests/distributed/gpu_transport -> repo root
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(_THIS_DIR)))
+_VLLM_OMNI_BASE = os.path.join(_REPO_ROOT, "vllm_omni")
 _GPU_TRANSPORT_PKG = "vllm_omni.distributed.gpu_transport"
 _GPU_TRANSPORT_BASE = f"{_VLLM_OMNI_BASE}/distributed/gpu_transport"
 
