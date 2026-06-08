@@ -2056,11 +2056,17 @@ class OmniConnectorModelRunnerMixin:
             connector = OmniConnectorFactory.create_connector(spec)
         except Exception as exc:
             raise RuntimeError(f"Failed to create connector {name}") from exc
-        # Remove Connection objects from extra so vLLM's config hash
-        # computation (which recursively walks extra) does not choke on
-        # unpicklable multiprocessing.Connection values.
-        extra.pop("ack_conn", None)
-        extra.pop("consumer_ack_conn", None)
+        # ACK pipes are stored in a module-level dict (popped from extra
+        # before they enter vLLM's config hash).  Wire them on the newly
+        # created connector.
+        stage_id = int(model_config.stage_id) if hasattr(model_config, "stage_id") else -1
+        if stage_id >= 0 and hasattr(connector, "set_ack_conns"):
+            from vllm_omni.engine.async_omni_engine import _STAGE_ACK_PIPES
+            pipes = _STAGE_ACK_PIPES.get(stage_id, {})
+            ack_conn = pipes.get("ack_conn")
+            consumer_ack_conn = pipes.get("consumer_ack_conn")
+            if ack_conn or consumer_ack_conn:
+                connector.set_ack_conns(ack_conn, consumer_ack_conn)
         return connector
 
     @staticmethod

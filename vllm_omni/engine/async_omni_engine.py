@@ -97,6 +97,12 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Module-level bridge for ACK pipe Connections.
+# Populated by _determine_stage_plans() before build_engine_args_dict strips
+# the unpicklable Connection objects from the connector spec extra.
+# Workers are forked so they inherit this module state.
+_STAGE_ACK_PIPES: dict[int, dict[str, Any]] = {}
+
 _STARTUP_POLL_INTERVAL_S = 1.0
 
 
@@ -523,6 +529,15 @@ class AsyncOmniEngine:
             if self._gpu_tensor_transport != "none" and stage_connector_spec:
                 extra = stage_connector_spec.setdefault("extra", {})
                 extra["gpu_transport_mode"] = self._gpu_tensor_transport
+            # Strip multiprocessing.Connection objects from extra before
+            # they enter vLLM's config hash computation.  Workers are
+            # forked so a module-level dict can bridge the gap.
+            if stage_connector_spec:
+                extra = stage_connector_spec.get("extra", {})
+                _STAGE_ACK_PIPES[configured_stage_id] = {
+                    "ack_conn": extra.pop("ack_conn", None),
+                    "consumer_ack_conn": extra.pop("consumer_ack_conn", None),
+                }
             omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, configured_stage_id)
             num_replicas = replicas_per_stage[stage_idx]
             launch_mode = "local"

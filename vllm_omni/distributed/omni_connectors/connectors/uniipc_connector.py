@@ -390,6 +390,16 @@ class UniIPCConnector(OmniConnectorBase):
             self._transport.close()
             self._transport = None
 
+    def set_ack_conns(self, ack_conn: Any, consumer_ack_conn: Any) -> None:
+        """Wire ACK pipe connections after construction.
+
+        Called after the connector is created, so that the
+        ``multiprocessing.Connection`` objects never enter vLLM's
+        config hash computation.
+        """
+        self._ack_conn = ack_conn
+        self._consumer_ack_conn = consumer_ack_conn
+
     @property
     def dst_device(self) -> str:
         """Configured destination GPU device string (e.g. ``cuda:7``)."""
