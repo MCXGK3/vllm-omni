@@ -40,7 +40,17 @@ def _resolve_funcs() -> None:
         return
 
     if bool(int(os.environ.get("VLLM_NVTX_SCOPES_FOR_PROFILING", "0"))):
-        import nvtx
+        try:
+            import nvtx
+        except ModuleNotFoundError:
+            logger.warning(
+                "VLLM_NVTX_SCOPES_FOR_PROFILING=1 but the 'nvtx' package is "
+                "not installed. Install it with: pip install nvtx. "
+                "NVTX profiling will be disabled for this session."
+            )
+            _RANGE_FUNC = lambda *a, **kw: contextlib.nullcontext()
+            _MARK_FUNC = lambda *a, **kw: None
+            return
 
         _RANGE_FUNC = nvtx.annotate
         _MARK_FUNC = nvtx.mark
