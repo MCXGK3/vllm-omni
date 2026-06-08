@@ -82,7 +82,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # Wire ACK pipes that were stripped from extra before vLLM
         # config hash computation (see async_omni_engine.py).
         # Workers are forked, so module-level state is inherited.
-        stage_id = int(getattr(model_config, "stage_id", -1))
+        extra = connector_config.get("extra", {})
+        stage_id = int(extra.get("stage_id", -1))
         if stage_id >= 0 and hasattr(connector, "set_ack_conns"):
             try:
                 from vllm_omni.engine.async_omni_engine import _STAGE_ACK_PIPES
