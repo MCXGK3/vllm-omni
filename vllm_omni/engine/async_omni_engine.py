@@ -461,22 +461,28 @@ class AsyncOmniEngine:
         prompt_expand_func = None
         stage_plans: list[LogicalStageInitPlan] = []
 
-        # Initialize GPU transport ACK channels if GPU transport is configured
+        # Initialize GPU transport ACK channels for edges that use GPU transport.
+        # Previously gated on a top-level gpu_transport_config that is never set
+        # by load_omni_transfer_config().  Scan connector extras instead.
         _ack_conns: dict[tuple[str, str], Any] = {}
         _consumer_ack_conns: dict[tuple[str, str], Any] = {}
-        if (omni_transfer_config is not None
-                and getattr(omni_transfer_config, 'gpu_transport_config', None) is not None):
+        if omni_transfer_config is not None:
             try:
                 from vllm_omni.distributed.gpu_transport.control_channel import ControlChannelPair
 
-                for edge_key in getattr(omni_transfer_config, 'connectors', {}):
-                    chan = ControlChannelPair()
-                    _ack_conns[edge_key] = chan.producer_conn
-                    _consumer_ack_conns[edge_key] = chan.consumer_conn
-                    logger.info(
-                        "[Orchestrator] Created ACK channel for edge %s->%s",
-                        edge_key[0], edge_key[1],
-                    )
+                for edge_key, connector_spec in getattr(
+                    omni_transfer_config, 'connectors', {}
+                ).items():
+                    extra = getattr(connector_spec, 'extra', {}) or {}
+                    gpu_mode = extra.get('gpu_transport_mode', 'none')
+                    if gpu_mode in ('cuda_ipc', 'cuda_copy'):
+                        chan = ControlChannelPair()
+                        _ack_conns[edge_key] = chan.producer_conn
+                        _consumer_ack_conns[edge_key] = chan.consumer_conn
+                        logger.info(
+                            "[Orchestrator] Created ACK channel for edge %s->%s (%s)",
+                            edge_key[0], edge_key[1], gpu_mode,
+                        )
             except Exception:
                 logger.warning(
                     "[Orchestrator] Failed to create GPU transport ACK channels",
