@@ -53,7 +53,7 @@ class TensorRegistry:
                 return False
             del self._entries[tensor_id]
             remaining = len(self._entries)
-        logger.info("registry: -%s remaining=%d", tensor_id, remaining)
+        logger.debug("registry: -%s remaining=%d", tensor_id, remaining)
         return True
 
     def exists(self, tensor_id: str) -> bool:

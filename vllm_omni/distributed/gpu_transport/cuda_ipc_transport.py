@@ -197,7 +197,7 @@ class CudaIpcTransport:
                 break
             tensor_id = msg.get("tensor_id", "")
             if tensor_id:
-                logger.info("ack_thread: releasing id=%s", tensor_id)
+                logger.debug("ack_thread: releasing id=%s", tensor_id)
                 self.release(tensor_id)
 
     def shutdown_ack_thread(self) -> None:

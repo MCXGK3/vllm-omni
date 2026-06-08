@@ -362,7 +362,7 @@ class UniIPCConnector(OmniConnectorBase):
             len(self._received_gpu_tensors.get(k, [])) for k in recv_keys
         )
         if total_tids:
-            logger.info(
+            logger.debug(
                 "release_gpu_tensors: req=%s put_keys=%d recv_keys=%d total_tids=%d",
                 request_id, len(put_keys), len(recv_keys), total_tids,
             )
@@ -376,15 +376,7 @@ class UniIPCConnector(OmniConnectorBase):
     def notify_gpu_tensor_consumed(self, tensor_id: str) -> None:
         """Notify producer that a GPU tensor (cuda_ipc mode) is no longer needed."""
         if self._transport is not None and hasattr(self._transport, 'notify_consumed'):
-            logger.info("notify_consumed: sending ACK for tensor_id=%s", tensor_id)
             self._transport.notify_consumed(tensor_id)
-        else:
-            logger.warning(
-                "notify_consumed: cannot send ACK for %s (transport=%s has_notify=%s)",
-                tensor_id,
-                self._transport is not None,
-                hasattr(self._transport, 'notify_consumed') if self._transport else False,
-            )
 
     def cleanup(self, request_id: str) -> None:
         """Clean SHM segments and release transport-held tensors."""
