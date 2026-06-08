@@ -444,6 +444,12 @@ async def async_request_openai_chat_omni_completions(
                                     elif modality == "audio":
                                         if output.audio_ttfp == 0.0:
                                             output.audio_ttfp = timestamp - st
+                                            # For speech-only streams there are no text
+                                            # deltas, so output.ttft stays at 0.  Use the
+                                            # first audio packet as TTFT so the generic
+                                            # benchmark metrics report meaningful values.
+                                            if output.ttft == 0.0:
+                                                output.ttft = output.audio_ttfp
                                             output.audio_text_gap = output.audio_ttfp - output.ttft
                                         else:
                                             output.audio_itl.append(timestamp - most_recent_audio_ts)
