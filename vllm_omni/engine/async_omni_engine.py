@@ -507,6 +507,10 @@ class AsyncOmniEngine:
                 stage_id=configured_stage_id,
                 async_chunk=self.async_chunk,
             )
+            # Ensure stage_id is in extra so downstream connector creation
+            # can look up ACK pipes by stage identity.
+            if stage_connector_spec:
+                stage_connector_spec.setdefault("extra", {})["stage_id"] = configured_stage_id
 
             # Inject GPU transport ACK pipe ends into connector spec
             if stage_connector_spec and _ack_conns:
