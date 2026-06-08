@@ -231,16 +231,20 @@ class UniIPCConnector(OmniConnectorBase):
         self._metrics["gpu_tensors_sent"] += 1
         return stripped, tensor_ids
 
-    def _reassemble(self, obj: Any) -> Any:
-        """Replace ``__gpux__`` markers with real GPU tensors."""
+    def _reassemble(self, obj: Any) -> tuple[Any, list[str]]:
+        """Replace ``__gpux__`` markers with real GPU tensors.
+
+        Returns ``(restored_obj, tensor_ids)`` — *tensor_ids* are collected
+        during the walk, avoiding a separate ``_collect_tensor_ids`` pass.
+        """
         if not self._has_markers(obj):
-            return obj
+            return obj, []
         self._init_transport()
         from vllm_omni.distributed.gpu_transport.split import (
             reassemble_gpu_tensors)
-        obj = reassemble_gpu_tensors(obj, self._transport)
+        obj, tensor_ids = reassemble_gpu_tensors(obj, self._transport)
         self._metrics["gpu_tensors_recv"] += 1
-        return obj
+        return obj, tensor_ids
 
     @staticmethod
     def _has_markers(obj: Any) -> bool:
@@ -349,18 +353,13 @@ class UniIPCConnector(OmniConnectorBase):
             if result is None:
                 return None
             obj, size = result
-            # Collect GPU tensor IDs before reassembly replaces __gpux__
-            # markers, then ACK immediately.
-            t_collect_start = time.perf_counter()
-            tensor_ids = None
+            # Reassembly now collects tensor IDs during the walk — no
+            # separate _collect_tensor_ids pass needed.
             has_markers_flag = self._has_markers(obj)
-            if has_markers_flag and self._transport_mode == "cuda_ipc":
-                tensor_ids = self._collect_tensor_ids(obj)
-            timing["collect_ids_ms"] = (time.perf_counter() - t_collect_start) * 1000.0
             t_reassemble_start = time.perf_counter()
-            obj = self._reassemble(obj)
+            obj, tensor_ids = self._reassemble(obj)
             timing["reassemble_ms"] = (time.perf_counter() - t_reassemble_start) * 1000.0
-            if tensor_ids:
+            if tensor_ids and self._transport_mode == "cuda_ipc":
                 t_ack_start = time.perf_counter()
                 for tid in tensor_ids:
                     self.notify_gpu_tensor_consumed(tid)
@@ -372,11 +371,10 @@ class UniIPCConnector(OmniConnectorBase):
             self._metrics["get_total_ms"] += timing["get_total_ms"]
             if has_markers_flag:
                 logger.info(
-                    "TIMING get: key=%s total=%.3fms shm=%.3fms collect=%.3fms "
-                    "reassemble=%.3fms ack=%.3fms",
+                    "TIMING get: key=%s total=%.3fms shm=%.3fms reassemble=%.3fms ack=%.3fms num_tids=%d",
                     get_key, timing["get_total_ms"], timing["shm_get_ms"],
-                    timing["collect_ids_ms"], timing["reassemble_ms"],
-                    timing["ack_ms"],
+                    timing["reassemble_ms"], timing["ack_ms"],
+                    len(tensor_ids or []),
                 )
             return obj, size
         except Exception:

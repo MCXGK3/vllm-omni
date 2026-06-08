@@ -143,16 +143,20 @@ def split_gpu_tensors(
     return obj, []
 
 
-def reassemble_gpu_tensors(obj: Any, transport: Any) -> Any:
+def reassemble_gpu_tensors(obj: Any, transport: Any) -> tuple[Any, list[str]]:
     """Walk *obj* and replace every ``__gpux__`` marker with a real GPU tensor.
+
+    Returns ``(restored_obj, tensor_ids)`` so callers do not need a
+    separate ``_collect_tensor_ids`` pass.
 
     Handles both IPC markers (original path) and inline markers
     (``inline_data`` key present).
     """
     if isinstance(obj, dict) and obj.get(_GPUX_MARKER):
+        tid = obj.get("tensor_id", "")
         # Inline path: recover from CPU bytes
         if "inline_data" in obj:
-            return _recover_inline_tensor(obj)
+            return _recover_inline_tensor(obj), [tid] if tid else []
 
         # IPC path (original)
         meta = TensorMetadata.from_dict(obj["meta"])
@@ -161,17 +165,29 @@ def reassemble_gpu_tensors(obj: Any, transport: Any) -> Any:
             if isinstance(obj["ipc_args"], bytes)
             else obj["ipc_args"]
         )
-        handle = TransportHandle(tensor_id=obj["tensor_id"], metadata=meta)
-        return transport.recv(
+        handle = TransportHandle(tensor_id=tid, metadata=meta)
+        tensor = transport.recv(
             handle,
             src_rank=transport._config.src_device,
             dst_device=_resolve_local_device(meta.dst_device),
         )
+        return tensor, [tid] if tid else []
 
     if isinstance(obj, dict):
-        return {k: reassemble_gpu_tensors(v, transport) for k, v in obj.items()}
+        result: dict[str, Any] = {}
+        ids: list[str] = []
+        for k, v in obj.items():
+            result[k], sub_ids = reassemble_gpu_tensors(v, transport)
+            ids.extend(sub_ids)
+        return result, ids
 
     if isinstance(obj, (list, tuple)):
-        return type(obj)(reassemble_gpu_tensors(v, transport) for v in obj)
+        items: list[Any] = []
+        ids: list[str] = []
+        for v in obj:
+            item, sub_ids = reassemble_gpu_tensors(v, transport)
+            items.append(item)
+            ids.extend(sub_ids)
+        return type(obj)(items), ids
 
-    return obj
+    return obj, []
