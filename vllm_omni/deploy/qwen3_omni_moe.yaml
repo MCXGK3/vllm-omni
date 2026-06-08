@@ -22,7 +22,7 @@ connectors:
   # uniipc_baseline:
   #   name: UniIPCConnector
   #   extra:
-  #     gpu_transport_mode: none
+  #     gpu_transport_mode: cuda_ipc
   #     src_device: 3
   #     dst_device: 7
 
@@ -30,7 +30,7 @@ connectors:
   # uniipc_none:
   #   name: UniIPCConnector
   #   extra:
-  #     gpu_transport_mode: none
+  #     gpu_transport_mode: cuda_ipc
   #     src_device: 3
   #     dst_device: 7
 
@@ -38,7 +38,7 @@ connectors:
   # uniipc_copy:
   #   name: UniIPCConnector
   #   extra:
-  #     gpu_transport_mode: none
+  #     gpu_transport_mode: cuda_ipc
   #     src_device: 3
   #     dst_device: 7
 
@@ -46,16 +46,16 @@ connectors:
   # uniipc_size_threshold:
   #   name: UniIPCConnector
   #   extra:
-  #     gpu_transport_mode: none
+  #     gpu_transport_mode: cuda_ipc
   #     src_device: 3
   #     dst_device: 7
-  #     gpu_transport_min_bytes: 65536
+  #     gpu_transport_min_bytes: 0
 
   # 实验 5：显存压力降级（空闲 < 85% 时降级 inline）
   # uniipc_pressure:
   #   name: UniIPCConnector
   #   extra:
-  #     gpu_transport_mode: none
+  #     gpu_transport_mode: cuda_ipc
   #     src_device: 3
   #     dst_device: 7
   #     gpu_memory_pressure_threshold: 0.85
@@ -64,11 +64,11 @@ connectors:
   uniipc_thinker_to_talker:
     name: UniIPCConnector
     extra:
-      gpu_transport_mode: none
+      gpu_transport_mode: cuda_ipc
       src_device: 3
       dst_device: 7
-      gpu_transport_min_bytes: 65536
-      release_timeout_ms: 10000
+      gpu_transport_min_bytes: 0
+      release_timeout_ms: 0
       # gpu_memory_pressure_threshold: 0.85
 
   # ============================================================
