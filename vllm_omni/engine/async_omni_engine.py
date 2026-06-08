@@ -97,11 +97,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# Module-level bridge for ACK pipe Connections.
-# Populated by _determine_stage_plans() before build_engine_args_dict strips
-# the unpicklable Connection objects from the connector spec extra.
-# Workers are forked so they inherit this module state.
-_STAGE_ACK_PIPES: dict[int, dict[str, Any]] = {}
+# Imported for class-level ACK pipe storage (see _determine_stage_plans).
+from vllm_omni.distributed.omni_connectors.connectors.uniipc_connector import \
+    UniIPCConnector
 
 _STARTUP_POLL_INTERVAL_S = 1.0
 
@@ -558,7 +556,7 @@ class AsyncOmniEngine:
                     "ack_conn": extra.pop("ack_conn", None),
                     "consumer_ack_conn": extra.pop("consumer_ack_conn", None),
                 }
-                _STAGE_ACK_PIPES[configured_stage_id] = saved
+                UniIPCConnector._stage_ack_pipes[configured_stage_id] = saved
                 logger.info(
                     "[Orchestrator] Stage-%d saved ACK pipes: ack=%s consumer_ack=%s",
                     configured_stage_id,

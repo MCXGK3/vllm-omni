@@ -2056,21 +2056,7 @@ class OmniConnectorModelRunnerMixin:
             connector = OmniConnectorFactory.create_connector(spec)
         except Exception as exc:
             raise RuntimeError(f"Failed to create connector {name}") from exc
-        # ACK pipes are stored in a module-level dict (popped from extra
-        # before they enter vLLM's config hash).  Workers are forked so
-        # module-level state is inherited.  Wire them on the newly
-        # created connector.
-        stage_id = int(extra.get("stage_id", -1))
-        if stage_id >= 0 and hasattr(connector, "set_ack_conns"):
-            try:
-                from vllm_omni.engine.async_omni_engine import _STAGE_ACK_PIPES
-                pipes = _STAGE_ACK_PIPES.get(stage_id, {})
-                ack_conn = pipes.get("ack_conn")
-                consumer_ack_conn = pipes.get("consumer_ack_conn")
-                if ack_conn or consumer_ack_conn:
-                    connector.set_ack_conns(ack_conn, consumer_ack_conn)
-            except Exception:
-                pass
+        # ACK pipes are wired centrally in OmniConnectorFactory.
         return connector
 
     @staticmethod

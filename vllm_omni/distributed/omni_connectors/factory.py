@@ -58,12 +58,15 @@ class OmniConnectorFactory:
         )
         if stage_id >= 0 and has_setter:
             try:
-                from vllm_omni.engine.async_omni_engine import _STAGE_ACK_PIPES
-                pipes = _STAGE_ACK_PIPES.get(stage_id, {})
+                # Use class-level dict on UniIPCConnector — survives fork
+                # where module-level variables are reset on re-import.
+                from vllm_omni.distributed.omni_connectors.connectors.uniipc_connector import \
+                    UniIPCConnector as _UIPC
+                pipes = _UIPC._stage_ack_pipes.get(stage_id, {})
                 ack_conn = pipes.get("ack_conn")
                 consumer_ack_conn = pipes.get("consumer_ack_conn")
                 logger.info(
-                    "[Stage-%s] _STAGE_ACK_PIPES entry: ack=%s consumer_ack=%s",
+                    "[Stage-%s] _stage_ack_pipes entry: ack=%s consumer_ack=%s",
                     stage_id, ack_conn is not None, consumer_ack_conn is not None,
                 )
                 if ack_conn or consumer_ack_conn:
