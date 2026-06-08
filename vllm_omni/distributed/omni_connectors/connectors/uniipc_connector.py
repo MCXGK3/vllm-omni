@@ -329,13 +329,19 @@ class UniIPCConnector(OmniConnectorBase):
             if result is None:
                 return None
             obj, size = result
-            # Track GPU tensor IDs before reassembly replaces markers,
-            # so they can be ACKed later via release_gpu_tensors().
+            # Collect GPU tensor IDs before reassembly replaces __gpux__
+            # markers, then ACK immediately: the producer can release
+            # each TensorRegistry entry as soon as the consumer has
+            # accessed it.  CUDA IPC reference counting keeps the memory
+            # alive on the consumer side until the tensor is GCed.
+            tensor_ids = None
             if self._has_markers(obj) and self._transport_mode == "cuda_ipc":
                 tensor_ids = self._collect_tensor_ids(obj)
-                if tensor_ids:
-                    self._received_gpu_tensors[get_key] = tensor_ids
             obj = self._reassemble(obj)
+            if tensor_ids:
+                self._received_gpu_tensors[get_key] = tensor_ids
+                for tid in tensor_ids:
+                    self.notify_gpu_tensor_consumed(tid)
             self._metrics["gets"] += 1
             self._metrics["get_total_ms"] += (time.perf_counter() - t0) * 1000.0
             return obj, size
