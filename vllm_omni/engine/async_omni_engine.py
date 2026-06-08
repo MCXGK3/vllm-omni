@@ -462,10 +462,11 @@ class AsyncOmniEngine:
         stage_plans: list[LogicalStageInitPlan] = []
 
         # Initialize GPU transport ACK channels for edges that use GPU transport.
-        # Previously gated on a top-level gpu_transport_config that is never set
-        # by load_omni_transfer_config().  Scan connector extras instead.
+        # Scan connector extras AND honour the --gpu-tensor-transport CLI flag
+        # so that a CLI-only override also gets ACK pipes wired.
         _ack_conns: dict[tuple[str, str], Any] = {}
         _consumer_ack_conns: dict[tuple[str, str], Any] = {}
+        _cli_gpu_mode = self._gpu_tensor_transport if self._gpu_tensor_transport != "none" else None
         if omni_transfer_config is not None:
             try:
                 from vllm_omni.distributed.gpu_transport.control_channel import ControlChannelPair
@@ -474,7 +475,7 @@ class AsyncOmniEngine:
                     omni_transfer_config, 'connectors', {}
                 ).items():
                     extra = getattr(connector_spec, 'extra', {}) or {}
-                    gpu_mode = extra.get('gpu_transport_mode', 'none')
+                    gpu_mode = _cli_gpu_mode or extra.get('gpu_transport_mode', 'none')
                     if gpu_mode in ('cuda_ipc', 'cuda_copy'):
                         chan = ControlChannelPair()
                         _ack_conns[edge_key] = chan.producer_conn
