@@ -46,16 +46,64 @@ class CudaCopyTransport:
 
     @staticmethod
     def _ensure_peer_access(src: int, dst: int) -> None:
+        """Enable P2P access between *src* and *dst* via CUDA Runtime API.
+
+        ``torch.cuda.device(i)`` is a context manager without an
+        ``enable_peer_access`` method, so we call the CUDA Runtime
+        directly via ctypes.
+        """
+        import ctypes
+        import ctypes.util
+        import os
+
+        # Locate libcudart once and cache it.
+        if not hasattr(CudaCopyTransport, "_libcudart"):
+            lib_path = ctypes.util.find_library("cudart")
+            if not lib_path:
+                for cand in (
+                    "/usr/local/cuda/lib64/libcudart.so",
+                    "/usr/local/cuda/targets/x86_64-linux/lib/libcudart.so",
+                ):
+                    if os.path.isfile(cand):
+                        lib_path = cand
+                        break
+            if not lib_path:
+                logger.warning("Cannot find libcudart; P2P access will not be enabled")
+                CudaCopyTransport._libcudart = None
+                return
+            lib = ctypes.CDLL(lib_path)
+            lib.cudaSetDevice.argtypes = [ctypes.c_int]
+            lib.cudaSetDevice.restype = ctypes.c_int
+            lib.cudaDeviceEnablePeerAccess.argtypes = [ctypes.c_int, ctypes.c_uint]
+            lib.cudaDeviceEnablePeerAccess.restype = ctypes.c_int
+            CudaCopyTransport._libcudart = lib
+
+        lib = CudaCopyTransport._libcudart
+        if lib is None:
+            return
+
         for i in (src, dst):
             for j in (src, dst):
                 if i == j:
                     continue
                 try:
                     if torch.cuda.can_device_access_peer(i, j):
-                        torch.cuda.device(i).enable_peer_access(j)
+                        err = lib.cudaSetDevice(i)
+                        if err != 0:
+                            logger.warning(
+                                "cudaSetDevice(%d) failed: %d", i, err)
+                            continue
+                        err = lib.cudaDeviceEnablePeerAccess(j, 0)
+                        if err != 0:
+                            logger.warning(
+                                "cudaDeviceEnablePeerAccess(%d->%d): cudaError=%d",
+                                i, j, err,
+                            )
                 except Exception as e:
                     logger.warning(
-                        "Failed to enable P2P access device %d -> %d: %s", i, j, e)
+                        "Failed to enable P2P access device %d -> %d: %s",
+                        i, j, e,
+                    )
 
     @staticmethod
     def _resolve_local_ordinals(
