@@ -580,6 +580,13 @@ class AsyncOmniEngine:
                     stage_connector_spec=stage_connector_spec,
                     engine_args_dict=engine_args_dict,
                 )
+                # Attach ACK pipe connections as a custom (non-dataclass)
+                # attribute so they survive process spawn and are not
+                # walked by vLLM's compute_hash.
+                if configured_stage_id in _STAGE_ACK_PIPES:
+                    stage_vllm_config._stage_ack_pipes = (
+                        _STAGE_ACK_PIPES[configured_stage_id]
+                    )
 
             for replica_id in range(num_replicas):
                 replica_cfg = copy.deepcopy(stage_cfg) if replica_id > 0 else stage_cfg

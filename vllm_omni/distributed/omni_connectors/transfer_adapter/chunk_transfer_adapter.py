@@ -81,17 +81,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         connector = OmniConnectorFactory.create_connector(connector_specs)
         # Wire ACK pipes that were stripped from extra before vLLM
         # config hash computation (see async_omni_engine.py).
-        stage_id = getattr(model_config, "stage_id", -1)
-        if stage_id >= 0 and hasattr(connector, "set_ack_conns"):
-            try:
-                from vllm_omni.engine.async_omni_engine import _STAGE_ACK_PIPES
-                pipes = _STAGE_ACK_PIPES.get(int(stage_id), {})
-                ack_conn = pipes.get("ack_conn")
-                consumer_ack_conn = pipes.get("consumer_ack_conn")
-                if ack_conn or consumer_ack_conn:
-                    connector.set_ack_conns(ack_conn, consumer_ack_conn)
-            except Exception:
-                pass
+        if hasattr(connector, "set_ack_conns"):
+            pipes = getattr(model_config, "_stage_ack_pipes", {})
+            ack_conn = pipes.get("ack_conn")
+            consumer_ack_conn = pipes.get("consumer_ack_conn")
+            if ack_conn or consumer_ack_conn:
+                connector.set_ack_conns(ack_conn, consumer_ack_conn)
         return connector
 
     def load_async(self, request: Request):
