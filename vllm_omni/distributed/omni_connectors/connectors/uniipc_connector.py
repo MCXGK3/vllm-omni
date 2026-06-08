@@ -275,6 +275,7 @@ class UniIPCConnector(OmniConnectorBase):
     ) -> tuple[bool, int, dict[str, Any] | None]:
         """Split GPU tensors, delegate metadata to SHM connector."""
         t0 = time.perf_counter()
+        tensor_ids = None
         try:
             stripped = self._split(data)
             # Track GPU transport tensor_ids for per-request ACK
@@ -284,6 +285,9 @@ class UniIPCConnector(OmniConnectorBase):
             success, size, metadata = self._shm.put(
                 from_stage, to_stage, put_key, stripped)
             if not success:
+                # SHM write failed — release GPU tensors already registered
+                # by _split(), otherwise they leak in the transport registry.
+                self._release_registered_tensors(put_key, tensor_ids)
                 return False, 0, None
             self._metrics["puts"] += 1
             self._metrics["bytes_transferred"] += size
@@ -291,7 +295,21 @@ class UniIPCConnector(OmniConnectorBase):
             return True, size, metadata
         except Exception:
             logger.exception("UniIPC put failed for key=%s", put_key)
+            self._release_registered_tensors(put_key, tensor_ids)
             return False, 0, None
+
+    def _release_registered_tensors(
+        self, put_key: str, tensor_ids: list[str] | None,
+    ) -> None:
+        """Release GPU transport registrations from a failed put."""
+        if tensor_ids:
+            self._pending_gpu_tensors.pop(put_key, None)
+        if tensor_ids and self._transport is not None:
+            for tid in tensor_ids:
+                try:
+                    self._transport.release(tid)
+                except Exception:
+                    pass
 
     def get(
         self,
