@@ -31,8 +31,6 @@ class CudaIpcTransport:
     def __init__(self, config: GPUTransportConfig):
         self._config = config
         self._registry = TensorRegistry(timeout_ms=config.release_timeout_ms)
-        self._ipc_args_store: dict[str, tuple] = {}
-        self._store_lock = threading.Lock()
         if config.enable_peer_access:
             self._ensure_peer_access(config.src_device, config.dst_device)
 
@@ -42,6 +40,7 @@ class CudaIpcTransport:
         self._ack_thread: threading.Thread | None = None
         self._ack_running = False
         self._ack_lock = threading.Lock()
+        self._consumer_ctrl: Any = None
         self._start_ack_thread()
 
     @staticmethod
@@ -164,8 +163,6 @@ class CudaIpcTransport:
         metadata.ipc_args = ipc_args
 
         self._registry.register(tid, tensor)
-        with self._store_lock:
-            self._ipc_args_store[tid] = ipc_args
 
         logger.debug(
             "send: id=%s shape=%s dtype=%s nbytes=%d ipc_ms=%.3f",
@@ -227,6 +224,13 @@ class CudaIpcTransport:
         """Signal the ACK thread to stop (does not join)."""
         self._ack_running = False
 
+    def _get_consumer_ctrl(self) -> Any:
+        """Lazy-init the ConsumerControl wrapper for the ACK connection."""
+        if self._consumer_ctrl is None and self._consumer_ack_conn is not None:
+            from .control_channel import ConsumerControl
+            self._consumer_ctrl = ConsumerControl(self._consumer_ack_conn)
+        return self._consumer_ctrl
+
     def notify_consumed(self, tensor_id: str) -> None:
         """Consumer calls this when done using a zero-copy tensor.
 
@@ -234,11 +238,10 @@ class CudaIpcTransport:
         from its TensorRegistry.  Safe to call multiple times (idempotent
         on the producer side).
         """
-        if self._consumer_ack_conn is None:
+        ctrl = self._get_consumer_ctrl()
+        if ctrl is None:
             return
         try:
-            from .control_channel import ConsumerControl
-            ctrl = ConsumerControl(self._consumer_ack_conn)
             ctrl.send_ack(tensor_id, ack_type="release")
             logger.debug("notify_consumed: sent release ACK for id=%s", tensor_id)
         except Exception:
@@ -247,11 +250,12 @@ class CudaIpcTransport:
 
     def notify_consumed_many(self, tensor_ids: list[str]) -> None:
         """Send one batched release ACK for multiple zero-copy tensors."""
-        if self._consumer_ack_conn is None or not tensor_ids:
+        if not tensor_ids:
+            return
+        ctrl = self._get_consumer_ctrl()
+        if ctrl is None:
             return
         try:
-            from .control_channel import ConsumerControl
-            ctrl = ConsumerControl(self._consumer_ack_conn)
             ctrl.send_ack_many(tensor_ids, ack_type="release")
             logger.debug(
                 "notify_consumed_many: sent release ACK for %d ids",
@@ -263,24 +267,17 @@ class CudaIpcTransport:
                 len(tensor_ids), exc_info=True)
 
     def release(self, tensor_id: str) -> None:
-        with self._store_lock:
-            self._ipc_args_store.pop(tensor_id, None)
         self._registry.release(tensor_id)
 
     def release_many(self, tensor_ids: list[str]) -> None:
         if not tensor_ids:
             return
-        with self._store_lock:
-            for tensor_id in tensor_ids:
-                self._ipc_args_store.pop(tensor_id, None)
         self._registry.release_many(tensor_ids)
 
     def close(self) -> None:
         self.shutdown_ack_thread()
         if self._ack_thread is not None and self._ack_thread.is_alive():
             self._ack_thread.join(timeout=2.0)
-        with self._store_lock:
-            self._ipc_args_store.clear()
         self._registry.clear()
 
     def cleanup_timeouts(self) -> list[str]:

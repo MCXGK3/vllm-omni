@@ -32,9 +32,7 @@ class CudaCopyTransport:
     def __init__(self, config: GPUTransportConfig):
         self._config = config
         self._registry = TensorRegistry(timeout_ms=config.release_timeout_ms)
-        self._ipc_args_store: dict[str, tuple] = {}
         self._copy_streams: dict[str, torch.cuda.Stream] = {}
-        self._store_lock = threading.Lock()
         self._stream_lock = threading.Lock()
         if config.enable_peer_access:
             self._ensure_peer_access(config.src_device, config.dst_device)
@@ -45,6 +43,7 @@ class CudaCopyTransport:
         self._ack_thread: threading.Thread | None = None
         self._ack_running = False
         self._ack_lock = threading.Lock()
+        self._consumer_ctrl: Any = None
         self._start_ack_thread()
 
     @staticmethod
@@ -117,36 +116,6 @@ class CudaCopyTransport:
                         i, j, e,
                     )
 
-    @staticmethod
-    def _resolve_local_ordinals(
-        src_physical: int, dst_dev: torch.device,
-    ) -> tuple[int | None, int | None]:
-        """Map physical GPU indices to local device ordinals.
-
-        When CUDA_VISIBLE_DEVICES remaps GPUs in a consumer process the
-        physical indices stored in config no longer match local ordinals.
-        Each element is ``None`` when the corresponding device is not
-        locally visible.
-        """
-        def _resolve_one(physical_idx: int) -> int | None:
-            try:
-                dev = torch.device(f"cuda:{physical_idx}")
-                with torch.cuda.device(dev):
-                    pass
-                return dev.index
-            except (RuntimeError, torch.AcceleratorError):
-                return None
-
-        src_local = _resolve_one(src_physical)
-        # dst_dev may already carry a remapped ordinal; validate it
-        try:
-            with torch.cuda.device(dst_dev):
-                pass
-            dst_local = dst_dev.index
-        except (RuntimeError, torch.AcceleratorError):
-            dst_local = None
-        return src_local, dst_local
-
     def _start_ack_thread(self) -> None:
         """Start the ACK thread if ack_conn is set. Idempotent."""
         with self._ack_lock:
@@ -200,8 +169,6 @@ class CudaCopyTransport:
         metadata.ipc_args = ipc_args
 
         self._registry.register(tid, tensor)
-        with self._store_lock:
-            self._ipc_args_store[tid] = ipc_args
 
         logger.debug(
             "send: id=%s shape=%s dtype=%s nbytes=%d sync_ms=%.3f ipc_ms=%.3f",
@@ -227,23 +194,6 @@ class CudaCopyTransport:
 
         dst_dev = torch.device(dst_device) if isinstance(dst_device, str) else dst_device
 
-        # Resolve both source and destination to local device ordinals.
-        # In deployments with CUDA_VISIBLE_DEVICES remapping the physical
-        # GPU indices stored in config do not match local ordinals.
-        src_local, dst_local = self._resolve_local_ordinals(self._config.src_device, dst_dev)
-
-        # Check P2P capability (skip for same-device, device can always access itself)
-        if src_local is not None and src_local != dst_local:
-            try:
-                has_peer = torch.cuda.can_device_access_peer(src_local, dst_local)
-            except (RuntimeError, AssertionError):
-                has_peer = False
-            if not has_peer:
-                raise RuntimeError(
-                    f"P2P access not available from device {src_local} "
-                    f"to {dst_local}. Enable peer access or use cuda_ipc mode instead."
-                )
-
         t0 = time.perf_counter()
         # 1. Open IPC allocation (zero-copy view of producer memory)
         with torch.cuda.device(dst_dev):
@@ -267,9 +217,10 @@ class CudaCopyTransport:
         # 4. Send copy_done ACK so producer can release the original tensor
         if self._consumer_ack_conn is not None:
             try:
-                from .control_channel import ConsumerControl
-                ctrl = ConsumerControl(self._consumer_ack_conn)
-                ctrl.send_ack(meta.tensor_id, ack_type="copy_done")
+                if self._consumer_ctrl is None:
+                    from .control_channel import ConsumerControl
+                    self._consumer_ctrl = ConsumerControl(self._consumer_ack_conn)
+                self._consumer_ctrl.send_ack(meta.tensor_id, ack_type="copy_done")
                 logger.debug("recv: sent copy_done ACK for id=%s", meta.tensor_id)
             except Exception:
                 logger.warning("recv: failed to send copy_done ACK for id=%s",
@@ -309,24 +260,17 @@ class CudaCopyTransport:
         self._ack_running = False
 
     def release(self, tensor_id: str) -> None:
-        with self._store_lock:
-            self._ipc_args_store.pop(tensor_id, None)
         self._registry.release(tensor_id)
 
     def release_many(self, tensor_ids: list[str]) -> None:
         if not tensor_ids:
             return
-        with self._store_lock:
-            for tensor_id in tensor_ids:
-                self._ipc_args_store.pop(tensor_id, None)
         self._registry.release_many(tensor_ids)
 
     def close(self) -> None:
         self.shutdown_ack_thread()
         if self._ack_thread is not None and self._ack_thread.is_alive():
             self._ack_thread.join(timeout=2.0)
-        with self._store_lock:
-            self._ipc_args_store.clear()
         self._registry.clear()
         with self._stream_lock:
             streams = list(self._copy_streams.values())

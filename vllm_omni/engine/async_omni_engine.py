@@ -97,10 +97,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# Imported for class-level ACK pipe storage (see _determine_stage_plans).
-from vllm_omni.distributed.omni_connectors.connectors.uniipc_connector import \
-    UniIPCConnector
-
 _STARTUP_POLL_INTERVAL_S = 1.0
 
 
@@ -470,6 +466,7 @@ class AsyncOmniEngine:
         # so that a CLI-only override also gets ACK pipes wired.
         _ack_conns: dict[tuple[str, str], Any] = {}
         _consumer_ack_conns: dict[tuple[str, str], Any] = {}
+        self._stage_ack_pipes: dict[int, dict[str, Any]] = {}
         _cli_gpu_mode = self._gpu_tensor_transport if self._gpu_tensor_transport != "none" else None
         if omni_transfer_config is not None:
             try:
@@ -540,7 +537,7 @@ class AsyncOmniEngine:
                     "ack_conn": extra.pop("ack_conn", None),
                     "consumer_ack_conn": extra.pop("consumer_ack_conn", None),
                 }
-                UniIPCConnector._stage_ack_pipes[configured_stage_id] = saved
+                self._stage_ack_pipes[configured_stage_id] = saved
             omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, configured_stage_id)
             num_replicas = replicas_per_stage[stage_idx]
             launch_mode = "local"
@@ -749,7 +746,7 @@ class AsyncOmniEngine:
                                     )
                                 )
                             else:
-                                stage_ack = UniIPCConnector._stage_ack_pipes.get(
+                                stage_ack = self._stage_ack_pipes.get(
                                     plan.metadata.stage_id, {}
                                 )
                                 stage_ack["stage_id"] = plan.metadata.stage_id

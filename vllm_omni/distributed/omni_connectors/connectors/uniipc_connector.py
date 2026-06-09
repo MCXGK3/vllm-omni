@@ -36,10 +36,6 @@ class UniIPCConnector(OmniConnectorBase):
     - ``release_timeout_ms`` (float): registry timeout (default 10000)
     """
 
-    # Class-level ACK pipe registry.  Populated by the orchestrator
-    # before stage workers are forked so the values survive fork.
-    _stage_ack_pipes: dict[int, dict[str, Any]] = {}
-
     def __init__(self, config: dict[str, Any]):
         self.config = config
         self.stage_id = config.get("stage_id", -1)
@@ -624,6 +620,7 @@ class UniIPCConnector(OmniConnectorBase):
         if self._transport is not None:
             self._transport._ack_conn = ack_conn
             self._transport._consumer_ack_conn = consumer_ack_conn
+            self._transport._consumer_ctrl = None  # invalidate cached ctrl
             if ack_conn is not None and hasattr(self._transport, "_start_ack_thread"):
                 self._transport._start_ack_thread()
 

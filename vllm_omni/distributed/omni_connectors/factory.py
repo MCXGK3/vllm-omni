@@ -93,11 +93,6 @@ def _create_shm_connector(config: dict[str, Any]) -> OmniConnectorBase:
     return SharedMemoryConnector(config)
 
 
-def _create_uniipc_connector(config: dict[str, Any]) -> OmniConnectorBase:
-    from .connectors.uniipc_connector import UniIPCConnector
-    return UniIPCConnector(config)
-
-
 def _create_yuanrong_connector(config: dict[str, Any]) -> OmniConnectorBase:
     try:
         from .connectors.yuanrong_connector import YuanrongConnector
