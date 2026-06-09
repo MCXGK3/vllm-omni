@@ -231,13 +231,16 @@ class UniIPCConnector(OmniConnectorBase):
         self._metrics["gpu_tensors_sent"] += 1
         return stripped, tensor_ids
 
-    def _reassemble(self, obj: Any) -> tuple[Any, list[str]]:
+    def _reassemble(self, obj: Any, skip_marker_check: bool = False) -> tuple[Any, list[str]]:
         """Replace ``__gpux__`` markers with real GPU tensors.
 
         Returns ``(restored_obj, tensor_ids)`` — *tensor_ids* are collected
         during the walk, avoiding a separate ``_collect_tensor_ids`` pass.
+
+        When *skip_marker_check* is True, the caller guarantees that *obj*
+        contains markers, avoiding a redundant full-payload walk.
         """
-        if not self._has_markers(obj):
+        if not skip_marker_check and not self._has_markers(obj):
             return obj, []
         self._init_transport()
         from vllm_omni.distributed.gpu_transport.split import (
@@ -353,11 +356,12 @@ class UniIPCConnector(OmniConnectorBase):
             if result is None:
                 return None
             obj, size = result
-            # Reassembly now collects tensor IDs during the walk — no
-            # separate _collect_tensor_ids pass needed.
+            # Reassembly collects tensor IDs during the walk.  The
+            # _has_markers check here informs _reassemble so it can
+            # skip a redundant full-payload walk.
             has_markers_flag = self._has_markers(obj)
             t_reassemble_start = time.perf_counter()
-            obj, tensor_ids = self._reassemble(obj)
+            obj, tensor_ids = self._reassemble(obj, skip_marker_check=has_markers_flag)
             timing["reassemble_ms"] = (time.perf_counter() - t_reassemble_start) * 1000.0
             if tensor_ids and self._transport_mode == "cuda_ipc":
                 t_ack_start = time.perf_counter()
