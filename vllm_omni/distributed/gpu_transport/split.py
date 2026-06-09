@@ -85,12 +85,14 @@ def split_gpu_tensors(
     transport: Any,
     router: Any = None,
     dst_device: str | None = None,
-) -> tuple[Any, list[str]]:
+    return_tensor_ids: bool = False,
+) -> Any:
     """Walk *obj* and replace every CUDA tensor with a ``__gpux__`` marker.
 
-    Returns ``(stripped_obj, tensor_ids)`` where *tensor_ids* is a flat list
-    of all tensor IDs encountered during the walk.  Callers no longer need to
-    perform a second pass with ``_collect_tensor_ids``.
+    By default returns only the stripped object for compatibility with older
+    callers.  If *return_tensor_ids* is True, returns
+    ``(stripped_obj, tensor_ids)`` where *tensor_ids* is a flat list of IPC
+    tensor IDs encountered during the walk.
 
     If *router* is provided, it is called for each tensor and must return
     ``"inline"`` or ``"ipc"``.  ``"inline"`` serializes the tensor to CPU
@@ -99,6 +101,19 @@ def split_gpu_tensors(
     If *router* is ``None``, all tensors go through the GPU transport
     (original behaviour).
     """
+    stripped, tensor_ids = _split_gpu_tensors_impl(
+        obj, transport, router=router, dst_device=dst_device)
+    if return_tensor_ids:
+        return stripped, tensor_ids
+    return stripped
+
+
+def _split_gpu_tensors_impl(
+    obj: Any,
+    transport: Any,
+    router: Any = None,
+    dst_device: str | None = None,
+) -> tuple[Any, list[str]]:
     if isinstance(obj, torch.Tensor) and obj.is_cuda:
         if router is not None:
             decision = router(obj)
@@ -106,10 +121,9 @@ def split_gpu_tensors(
                 marker = _make_inline_marker(
                     obj, dst_device=dst_device or str(obj.device)
                 )
-                return marker, [marker["tensor_id"]]
+                return marker, []
         # Original IPC path
         handle = transport.send(obj, dst_rank=transport._config.dst_device)
-        handle.metadata.ipc_args = transport._ipc_args_store[handle.tensor_id]
         marker = {
             _GPUX_MARKER: True,
             "tensor_id": handle.tensor_id,
@@ -127,7 +141,8 @@ def split_gpu_tensors(
         result: dict[str, Any] = {}
         ids: list[str] = []
         for k, v in obj.items():
-            result[k], sub_ids = split_gpu_tensors(v, transport, router=router, dst_device=dst_device)
+            result[k], sub_ids = _split_gpu_tensors_impl(
+                v, transport, router=router, dst_device=dst_device)
             ids.extend(sub_ids)
         return result, ids
 
@@ -135,7 +150,8 @@ def split_gpu_tensors(
         items: list[Any] = []
         ids: list[str] = []
         for v in obj:
-            item, sub_ids = split_gpu_tensors(v, transport, router=router, dst_device=dst_device)
+            item, sub_ids = _split_gpu_tensors_impl(
+                v, transport, router=router, dst_device=dst_device)
             items.append(item)
             ids.extend(sub_ids)
         return type(obj)(items), ids
@@ -143,20 +159,33 @@ def split_gpu_tensors(
     return obj, []
 
 
-def reassemble_gpu_tensors(obj: Any, transport: Any) -> tuple[Any, list[str]]:
+def reassemble_gpu_tensors(
+    obj: Any,
+    transport: Any,
+    return_tensor_ids: bool = False,
+) -> Any:
     """Walk *obj* and replace every ``__gpux__`` marker with a real GPU tensor.
 
-    Returns ``(restored_obj, tensor_ids)`` so callers do not need a
-    separate ``_collect_tensor_ids`` pass.
+    By default returns only the restored object for compatibility with older
+    callers.  If *return_tensor_ids* is True, returns
+    ``(restored_obj, tensor_ids)`` so callers do not need a separate
+    ``_collect_tensor_ids`` pass.
 
     Handles both IPC markers (original path) and inline markers
     (``inline_data`` key present).
     """
+    restored, tensor_ids = _reassemble_gpu_tensors_impl(obj, transport)
+    if return_tensor_ids:
+        return restored, tensor_ids
+    return restored
+
+
+def _reassemble_gpu_tensors_impl(obj: Any, transport: Any) -> tuple[Any, list[str]]:
     if isinstance(obj, dict) and obj.get(_GPUX_MARKER):
         tid = obj.get("tensor_id", "")
         # Inline path: recover from CPU bytes
         if "inline_data" in obj:
-            return _recover_inline_tensor(obj), [tid] if tid else []
+            return _recover_inline_tensor(obj), []
 
         # IPC path (original)
         meta = TensorMetadata.from_dict(obj["meta"])
@@ -177,7 +206,7 @@ def reassemble_gpu_tensors(obj: Any, transport: Any) -> tuple[Any, list[str]]:
         result: dict[str, Any] = {}
         ids: list[str] = []
         for k, v in obj.items():
-            result[k], sub_ids = reassemble_gpu_tensors(v, transport)
+            result[k], sub_ids = _reassemble_gpu_tensors_impl(v, transport)
             ids.extend(sub_ids)
         return result, ids
 
@@ -185,7 +214,7 @@ def reassemble_gpu_tensors(obj: Any, transport: Any) -> tuple[Any, list[str]]:
         items: list[Any] = []
         ids: list[str] = []
         for v in obj:
-            item, sub_ids = reassemble_gpu_tensors(v, transport)
+            item, sub_ids = _reassemble_gpu_tensors_impl(v, transport)
             items.append(item)
             ids.extend(sub_ids)
         return type(obj)(items), ids

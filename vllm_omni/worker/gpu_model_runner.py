@@ -1464,6 +1464,9 @@ class OmniGPUModelRunner(GPUModelRunner):
             **model_kwargs,
             **model_kwargs_extra,
         )
+        if hasattr(self, "mark_stage_payload_consumed"):
+            for req_id in getattr(self.input_batch, "req_ids", ()):
+                self.mark_stage_payload_consumed(req_id)
         if not isinstance(model_output, OmniOutput) and hasattr(self.model, "make_omni_output"):
             model_output = self.model.make_omni_output(model_output, **model_kwargs, **model_kwargs_extra)
         # Cache model output so later sample_tokens can consume multimodal results.

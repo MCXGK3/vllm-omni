@@ -56,6 +56,30 @@ class TensorRegistry:
         logger.debug("registry: -%s remaining=%d", tensor_id, remaining)
         return True
 
+    def release_many(self, tensor_ids: list[str]) -> int:
+        """Release many tensor IDs under one registry lock.
+
+        Returns the number of entries that existed and were removed.
+        """
+        if not tensor_ids:
+            return 0
+        released = 0
+        missing: list[str] = []
+        with self._lock:
+            for tensor_id in tensor_ids:
+                if tensor_id in self._entries:
+                    del self._entries[tensor_id]
+                    released += 1
+                else:
+                    missing.append(tensor_id)
+            remaining = len(self._entries)
+        if missing:
+            logger.debug(
+                "registry: release_many skipped %d unknown ids", len(missing))
+        logger.debug(
+            "registry: -%d ids remaining=%d", released, remaining)
+        return released
+
     def exists(self, tensor_id: str) -> bool:
         with self._lock:
             return tensor_id in self._entries

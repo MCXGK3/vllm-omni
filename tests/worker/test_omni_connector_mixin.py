@@ -330,6 +330,27 @@ class TestMixinNoConnector(unittest.TestCase):
         host.shutdown_omni_connectors()
 
 
+class TestMixinLazyRuntimeState(unittest.TestCase):
+    """Methods tolerate runners whose connector init has not run yet."""
+
+    def test_missing_connector_fields_do_not_raise(self):
+        host = MixinHost()
+
+        self.assertIsNone(host.connector)
+        self.assertIsNone(host.get_local_stage_payload("req-1"))
+        self.assertFalse(host.send_chunk(_make_request("req-1"), pooling_output={}))
+        self.assertEqual(host.send_kv_cache({}, [], block_size=16, cache_dtype="float16"), [])
+        self.assertEqual(host.recv_kv_cache("req-1"), (None, 0))
+
+        host.track_stage_payload_get_key("req-1", "missing-key")
+        host.mark_stage_payload_consumed("req-1")
+        host.cleanup_finished_request("req-1")
+        output = host.get_omni_connector_output()
+        self.assertIsInstance(output, OmniConnectorOutput)
+
+        host.shutdown_omni_connectors()
+
+
 class TestFinishedLoadReqsDrain(unittest.TestCase):
     """Test A1 fix: get_omni_connector_output drains _finished_load_reqs."""
 

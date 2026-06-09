@@ -58,8 +58,11 @@ class ProducerControl:
         try:
             msg = self._conn.recv()
             if isinstance(msg, dict) and msg.get("type") in ("ack", "copy_done", "release"):
-                logger.debug("control: recv %s for id=%s",
-                            msg.get("type"), msg.get("tensor_id"))
+                tensor_ids = msg.get("tensor_ids")
+                logger.debug(
+                    "control: recv %s for id=%s ids=%s",
+                    msg.get("type"), msg.get("tensor_id"), tensor_ids,
+                )
                 return msg
         except EOFError:
             logger.warning("control: pipe closed (consumer exited?)")
@@ -94,6 +97,21 @@ class ConsumerControl:
         msg = {"type": ack_type, "tensor_id": tensor_id, "timestamp": time.monotonic()}
         self._conn.send(msg)
         logger.debug("control: sent %s for id=%s", ack_type, tensor_id)
+
+    def send_ack_many(self, tensor_ids: list[str], ack_type: str = "release") -> None:
+        if not tensor_ids:
+            return
+        if len(tensor_ids) == 1:
+            self.send_ack(tensor_ids[0], ack_type=ack_type)
+            return
+        msg = {
+            "type": ack_type,
+            "tensor_ids": list(tensor_ids),
+            "timestamp": time.monotonic(),
+        }
+        self._conn.send(msg)
+        logger.debug(
+            "control: sent %s for %d ids", ack_type, len(tensor_ids))
 
     def close(self) -> None:
         self._conn.close()

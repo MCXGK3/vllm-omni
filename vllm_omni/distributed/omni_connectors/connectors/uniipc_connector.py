@@ -10,6 +10,8 @@ across process boundaries.
 from __future__ import annotations
 
 import os
+import queue
+import threading
 import time
 from typing import Any
 
@@ -52,6 +54,11 @@ class UniIPCConnector(OmniConnectorBase):
         self._release_timeout_ms: float = float(
             config.get("release_timeout_ms", 10_000.0))
         self._transport: Any = None  # lazy-init
+        self._transport_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._deferred_ack_queue: queue.Queue[tuple[Any | None, list[str]] | None] = queue.Queue()
+        self._deferred_ack_thread: threading.Thread | None = None
+        self._deferred_ack_running = False
 
         # Size threshold: skip GPU transport for small tensors (0 = disabled)
         self._gpu_transport_min_bytes: int = int(
@@ -99,69 +106,139 @@ class UniIPCConnector(OmniConnectorBase):
         """
         if self._transport is not None:
             return
+        with self._transport_lock:
+            if self._transport is not None:
+                return
 
-        # "none" mode: no transport needed, router always returns "inline"
-        if self._transport_mode == "none":
+            # "none" mode: no transport needed, router always returns "inline"
+            if self._transport_mode == "none":
+                return
+
+            import importlib.util
+            import sys
+
+            gpu_base = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                "gpu_transport",
+            )
+
+            def _load(name, fname):
+                full = f"vllm_omni.distributed.gpu_transport.{name}"
+                if full in sys.modules:
+                    return sys.modules[full]
+                path = os.path.join(gpu_base, fname)
+                spec = importlib.util.spec_from_file_location(full, path)
+                mod = importlib.util.module_from_spec(spec)
+                mod.__package__ = "vllm_omni.distributed.gpu_transport"
+                sys.modules[full] = mod
+                spec.loader.exec_module(mod)
+                return mod
+
+            _load("config", "config.py")
+            # Load dependencies needed by create_transport imports
+            _load("logging", "logging.py")
+            _load("protocol", "protocol.py")
+            _load("tensor_registry", "tensor_registry.py")
+            _load("ipc_utils", "ipc_utils.py")
+            _load("cuda_ipc_transport", "cuda_ipc_transport.py")
+            _load("cuda_copy_transport", "cuda_copy_transport.py")
+
+            # Ensure the gpu_transport package itself is loaded (not a stub),
+            # so create_transport is importable from it.
+            pkg_name = "vllm_omni.distributed.gpu_transport"
+            pkg_path = os.path.join(gpu_base, "__init__.py")
+            if os.path.isfile(pkg_path):
+                spec = importlib.util.spec_from_file_location(pkg_name, pkg_path)
+                pkg_mod = importlib.util.module_from_spec(spec)
+                pkg_mod.__package__ = pkg_name
+                pkg_mod.__path__ = [gpu_base]
+                sys.modules[pkg_name] = pkg_mod
+                spec.loader.exec_module(pkg_mod)
+
+            from vllm_omni.distributed.gpu_transport.config import GPUTransportConfig
+            from vllm_omni.distributed.gpu_transport import create_transport
+
+            transport_config = GPUTransportConfig(
+                mode=self._transport_mode,
+                src_device=self._src_device,
+                dst_device=self._dst_device,
+                release_timeout_ms=self._release_timeout_ms,
+                ack_conn=self._ack_conn,
+                consumer_ack_conn=self._consumer_ack_conn,
+            )
+            self._transport = create_transport(transport_config)
+
+            # Start ACK thread if transport supports it and ack_conn is wired
+            if self._transport is not None and self._ack_conn is not None:
+                if hasattr(self._transport, '_start_ack_thread'):
+                    self._transport._start_ack_thread()
+
+    def _start_deferred_ack_thread(self) -> None:
+        """Start the consumer-side CUDA-event ACK worker."""
+        if self._deferred_ack_running:
             return
-
-        import importlib.util
-        import sys
-
-        gpu_base = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            "gpu_transport",
+        self._deferred_ack_running = True
+        self._deferred_ack_thread = threading.Thread(
+            target=self._deferred_ack_loop,
+            name=f"uniipc-ack-stage-{self.stage_id}",
+            daemon=True,
         )
+        self._deferred_ack_thread.start()
 
-        def _load(name, fname):
-            full = f"vllm_omni.distributed.gpu_transport.{name}"
-            if full in sys.modules:
-                return sys.modules[full]
-            path = os.path.join(gpu_base, fname)
-            spec = importlib.util.spec_from_file_location(full, path)
-            mod = importlib.util.module_from_spec(spec)
-            mod.__package__ = "vllm_omni.distributed.gpu_transport"
-            sys.modules[full] = mod
-            spec.loader.exec_module(mod)
-            return mod
+    def _deferred_ack_loop(self) -> None:
+        while self._deferred_ack_running:
+            item = self._deferred_ack_queue.get()
+            if item is None:
+                break
+            event, tensor_ids = item
+            try:
+                if event is not None:
+                    event.synchronize()
+                self.notify_gpu_tensors_consumed(tensor_ids)
+            except Exception:
+                logger.warning(
+                    "Deferred GPU tensor ACK failed for ids=%s",
+                    tensor_ids,
+                    exc_info=True,
+                )
+        self._deferred_ack_running = False
 
-        _load("config", "config.py")
-        # Load dependencies needed by create_transport imports
-        _load("logging", "logging.py")
-        _load("protocol", "protocol.py")
-        _load("tensor_registry", "tensor_registry.py")
-        _load("ipc_utils", "ipc_utils.py")
-        _load("cuda_ipc_transport", "cuda_ipc_transport.py")
-        _load("cuda_copy_transport", "cuda_copy_transport.py")
+    def _shutdown_deferred_ack_thread(self) -> None:
+        if self._deferred_ack_thread is None:
+            return
+        self._deferred_ack_queue.put(None)
+        if self._deferred_ack_thread.is_alive():
+            self._deferred_ack_thread.join(timeout=2.0)
+        self._deferred_ack_thread = None
+        self._deferred_ack_running = False
 
-        # Ensure the gpu_transport package itself is loaded (not a stub),
-        # so create_transport is importable from it.
-        pkg_name = "vllm_omni.distributed.gpu_transport"
-        pkg_path = os.path.join(gpu_base, "__init__.py")
-        if os.path.isfile(pkg_path):
-            spec = importlib.util.spec_from_file_location(pkg_name, pkg_path)
-            pkg_mod = importlib.util.module_from_spec(spec)
-            pkg_mod.__package__ = pkg_name
-            pkg_mod.__path__ = [gpu_base]
-            sys.modules[pkg_name] = pkg_mod
-            spec.loader.exec_module(pkg_mod)
+    def _enqueue_received_tensor_ack(
+        self,
+        tensor_ids: list[str],
+        *,
+        wait_cuda_event: bool,
+    ) -> None:
+        if not tensor_ids:
+            return
+        event = None
+        if wait_cuda_event:
+            try:
+                import torch
 
-        from vllm_omni.distributed.gpu_transport.config import GPUTransportConfig
-        from vllm_omni.distributed.gpu_transport import create_transport
-
-        transport_config = GPUTransportConfig(
-            mode=self._transport_mode,
-            src_device=self._src_device,
-            dst_device=self._dst_device,
-            release_timeout_ms=self._release_timeout_ms,
-            ack_conn=self._ack_conn,
-            consumer_ack_conn=self._consumer_ack_conn,
-        )
-        self._transport = create_transport(transport_config)
-
-        # Start ACK thread if transport supports it and ack_conn is wired
-        if self._transport is not None and self._ack_conn is not None:
-            if hasattr(self._transport, '_start_ack_thread'):
-                self._transport._start_ack_thread()
+                if torch.cuda.is_available():
+                    event = torch.cuda.Event()
+                    event.record(torch.cuda.current_stream())
+            except Exception:
+                logger.debug(
+                    "Failed to record CUDA event for GPU tensor ACK; ACKing immediately",
+                    exc_info=True,
+                )
+                event = None
+        if event is None:
+            self.notify_gpu_tensors_consumed(tensor_ids)
+            return
+        self._start_deferred_ack_thread()
+        self._deferred_ack_queue.put((event, list(tensor_ids)))
 
     def _route_tensor(self, tensor: "torch.Tensor") -> str:
         """Decide transport strategy for a single GPU tensor.
@@ -177,14 +254,16 @@ class UniIPCConnector(OmniConnectorBase):
 
         # Dimension 1: mode "none" always inlines
         if self._transport_mode == "none":
-            self._metrics["gpu_tensors_inlined"] += 1
-            self._metrics["inline_bytes"] += nbytes
+            with self._state_lock:
+                self._metrics["gpu_tensors_inlined"] += 1
+                self._metrics["inline_bytes"] += nbytes
             return "inline"
 
         # Dimension 2: size threshold
         if nbytes < self._gpu_transport_min_bytes:
-            self._metrics["gpu_tensors_inlined"] += 1
-            self._metrics["inline_bytes"] += nbytes
+            with self._state_lock:
+                self._metrics["gpu_tensors_inlined"] += 1
+                self._metrics["inline_bytes"] += nbytes
             return "inline"
 
         # Dimension 3: memory pressure (producer-side only for cuda_ipc)
@@ -193,9 +272,10 @@ class UniIPCConnector(OmniConnectorBase):
             free, total = torch.cuda.mem_get_info(tensor.device)
             ratio = free / total
             if ratio < self._gpu_memory_pressure_threshold:
-                self._metrics["gpu_tensors_inlined"] += 1
-                self._metrics["inline_bytes"] += nbytes
-                self._metrics["pressure_fallbacks"] += 1
+                with self._state_lock:
+                    self._metrics["gpu_tensors_inlined"] += 1
+                    self._metrics["inline_bytes"] += nbytes
+                    self._metrics["pressure_fallbacks"] += 1
                 return "inline"
 
         return "ipc"
@@ -227,8 +307,10 @@ class UniIPCConnector(OmniConnectorBase):
             obj, self._transport,
             router=self._route_tensor,
             dst_device=f"cuda:{self._dst_device}",
+            return_tensor_ids=True,
         )
-        self._metrics["gpu_tensors_sent"] += 1
+        with self._state_lock:
+            self._metrics["gpu_tensors_sent"] += 1
         return stripped, tensor_ids
 
     def _reassemble(self, obj: Any, skip_marker_check: bool = False) -> tuple[Any, list[str]]:
@@ -245,8 +327,10 @@ class UniIPCConnector(OmniConnectorBase):
         self._init_transport()
         from vllm_omni.distributed.gpu_transport.split import (
             reassemble_gpu_tensors)
-        obj, tensor_ids = reassemble_gpu_tensors(obj, self._transport)
-        self._metrics["gpu_tensors_recv"] += 1
+        obj, tensor_ids = reassemble_gpu_tensors(
+            obj, self._transport, return_tensor_ids=True)
+        with self._state_lock:
+            self._metrics["gpu_tensors_recv"] += 1
         return obj, tensor_ids
 
     @staticmethod
@@ -297,7 +381,8 @@ class UniIPCConnector(OmniConnectorBase):
             stripped, tensor_ids = self._split(data)
             timing["split_ms"] = (time.perf_counter() - t_split_start) * 1000.0
             if tensor_ids:
-                self._pending_gpu_tensors[put_key] = tensor_ids
+                with self._state_lock:
+                    self._pending_gpu_tensors[put_key] = tensor_ids
             t_shm_start = time.perf_counter()
             success, size, metadata = self._shm.put(
                 from_stage, to_stage, put_key, stripped)
@@ -305,12 +390,13 @@ class UniIPCConnector(OmniConnectorBase):
             if not success:
                 self._release_registered_tensors(put_key, tensor_ids)
                 return False, 0, None
-            self._metrics["puts"] += 1
-            self._metrics["bytes_transferred"] += size
             timing["put_total_ms"] = (time.perf_counter() - t0) * 1000.0
-            self._metrics["put_total_ms"] += timing["put_total_ms"]
+            with self._state_lock:
+                self._metrics["puts"] += 1
+                self._metrics["bytes_transferred"] += size
+                self._metrics["put_total_ms"] += timing["put_total_ms"]
             if tensor_ids:
-                logger.info(
+                logger.debug(
                     "TIMING put: key=%s total=%.3fms split=%.3fms shm=%.3fms size=%d num_tids=%d",
                     put_key, timing["put_total_ms"], timing["split_ms"],
                     timing["shm_put_ms"], size, len(tensor_ids or []),
@@ -326,11 +412,13 @@ class UniIPCConnector(OmniConnectorBase):
     ) -> None:
         """Release GPU transport registrations from a failed put."""
         if tensor_ids:
-            self._pending_gpu_tensors.pop(put_key, None)
-        if tensor_ids and self._transport is not None:
+            with self._state_lock:
+                self._pending_gpu_tensors.pop(put_key, None)
+        transport = self._transport
+        if tensor_ids and transport is not None:
             for tid in tensor_ids:
                 try:
-                    self._transport.release(tid)
+                    transport.release(tid)
                 except Exception:
                     pass
 
@@ -343,9 +431,9 @@ class UniIPCConnector(OmniConnectorBase):
     ) -> tuple[Any, int] | None:
         """Retrieve via SHM connector, then reassemble GPU tensors.
 
-        ACKs each GPU tensor immediately after reassembly so the
-        producer can release its TensorRegistry entry without waiting
-        for request completion.
+        CUDA IPC tensors are ACKed during request cleanup, not here.
+        The rebuilt tensor is a zero-copy view of producer memory, so
+        producer-side lifetime must cover downstream GPU work.
         """
         t0 = time.perf_counter()
         timing = {}
@@ -364,17 +452,17 @@ class UniIPCConnector(OmniConnectorBase):
             obj, tensor_ids = self._reassemble(obj, skip_marker_check=has_markers_flag)
             timing["reassemble_ms"] = (time.perf_counter() - t_reassemble_start) * 1000.0
             if tensor_ids and self._transport_mode == "cuda_ipc":
-                t_ack_start = time.perf_counter()
-                for tid in tensor_ids:
-                    self.notify_gpu_tensor_consumed(tid)
-                timing["ack_ms"] = (time.perf_counter() - t_ack_start) * 1000.0
+                with self._state_lock:
+                    self._received_gpu_tensors[get_key] = tensor_ids
+                timing["ack_ms"] = 0.0
             else:
                 timing["ack_ms"] = 0.0
-            self._metrics["gets"] += 1
             timing["get_total_ms"] = (time.perf_counter() - t0) * 1000.0
-            self._metrics["get_total_ms"] += timing["get_total_ms"]
+            with self._state_lock:
+                self._metrics["gets"] += 1
+                self._metrics["get_total_ms"] += timing["get_total_ms"]
             if has_markers_flag:
-                logger.info(
+                logger.debug(
                     "TIMING get: key=%s total=%.3fms shm=%.3fms reassemble=%.3fms ack=%.3fms num_tids=%d",
                     get_key, timing["get_total_ms"], timing["shm_get_ms"],
                     timing["reassemble_ms"], timing["ack_ms"],
@@ -386,32 +474,106 @@ class UniIPCConnector(OmniConnectorBase):
             return None
 
     def release_gpu_tensors(self, request_id: str) -> None:
-        """Release GPU transport tensors for *request_id* via Pipe ACK."""
+        """Release GPU transport tensors for *request_id*.
+
+        Tensors produced by this connector are released from the local
+        registry.  Tensors consumed by this connector are ACKed to their
+        producer after the request is done using the zero-copy IPC view.
+        """
         prefix = f"{request_id}_"
-        # Producer side: tensors sent via put()
-        put_keys = [k for k in list(self._pending_gpu_tensors) if k.startswith(prefix)]
-        recv_keys = [k for k in list(self._received_gpu_tensors) if k.startswith(prefix)]
-        total_tids = sum(
-            len(self._pending_gpu_tensors.get(k, [])) for k in put_keys
-        ) + sum(
-            len(self._received_gpu_tensors.get(k, [])) for k in recv_keys
-        )
+        with self._state_lock:
+            put_keys = [
+                k for k in self._pending_gpu_tensors
+                if k == request_id or k.startswith(prefix)
+            ]
+            recv_keys = [
+                k for k in self._received_gpu_tensors
+                if k == request_id or k.startswith(prefix)
+            ]
+            pending_tids = [
+                tid
+                for key in put_keys
+                for tid in self._pending_gpu_tensors.pop(key, [])
+            ]
+            received_tids = [
+                tid
+                for key in recv_keys
+                for tid in self._received_gpu_tensors.pop(key, [])
+            ]
+        total_tids = len(pending_tids) + len(received_tids)
         if total_tids:
             logger.debug(
                 "release_gpu_tensors: req=%s put_keys=%d recv_keys=%d total_tids=%d",
                 request_id, len(put_keys), len(recv_keys), total_tids,
             )
-        for key in put_keys:
-            for tid in self._pending_gpu_tensors.pop(key, []):
-                self.notify_gpu_tensor_consumed(tid)
-        for key in recv_keys:
-            for tid in self._received_gpu_tensors.pop(key, []):
-                self.notify_gpu_tensor_consumed(tid)
+        transport = self._transport
+        if transport is not None:
+            try:
+                if hasattr(transport, "release_many"):
+                    transport.release_many(pending_tids)
+                else:
+                    for tid in pending_tids:
+                        transport.release(tid)
+            except Exception:
+                logger.debug(
+                    "release_gpu_tensors: local release failed for %d ids",
+                    len(pending_tids), exc_info=True)
+        self.notify_gpu_tensors_consumed(received_tids)
+
+    def release_received_gpu_tensors(
+        self,
+        get_key: str,
+        *,
+        wait_cuda_event: bool = True,
+    ) -> None:
+        """ACK received CUDA IPC tensors for one connector get key.
+
+        This is the fast-path lifetime hook for zero-copy CUDA IPC.  Call it
+        from the consumer after the payload identified by *get_key* has been
+        submitted to the GPU.  When *wait_cuda_event* is True, ACK is deferred
+        until work already enqueued on the current CUDA stream completes.
+        """
+        with self._state_lock:
+            tensor_ids = self._received_gpu_tensors.pop(get_key, [])
+        self._enqueue_received_tensor_ack(
+            tensor_ids,
+            wait_cuda_event=wait_cuda_event,
+        )
+
+    def release_pending_gpu_tensors(self, put_key: str) -> None:
+        """Release locally produced GPU tensors for one connector put key."""
+        with self._state_lock:
+            tensor_ids = self._pending_gpu_tensors.pop(put_key, [])
+        transport = self._transport
+        if transport is None:
+            return
+        try:
+            if hasattr(transport, "release_many"):
+                transport.release_many(tensor_ids)
+            else:
+                for tid in tensor_ids:
+                    transport.release(tid)
+        except Exception:
+            logger.debug(
+                "release_pending_gpu_tensors: local release failed for %d ids",
+                len(tensor_ids),
+                exc_info=True,
+            )
 
     def notify_gpu_tensor_consumed(self, tensor_id: str) -> None:
         """Notify producer that a GPU tensor (cuda_ipc mode) is no longer needed."""
         if self._transport is not None and hasattr(self._transport, 'notify_consumed'):
             self._transport.notify_consumed(tensor_id)
+
+    def notify_gpu_tensors_consumed(self, tensor_ids: list[str]) -> None:
+        """Notify producer that multiple GPU tensors are no longer needed."""
+        if not tensor_ids or self._transport is None:
+            return
+        if hasattr(self._transport, "notify_consumed_many"):
+            self._transport.notify_consumed_many(tensor_ids)
+            return
+        for tid in tensor_ids:
+            self.notify_gpu_tensor_consumed(tid)
 
     def cleanup(self, request_id: str) -> None:
         """Clean SHM segments and release transport-held tensors."""
@@ -420,17 +582,35 @@ class UniIPCConnector(OmniConnectorBase):
 
     def close(self) -> None:
         """Release SHM connector and GPU transport."""
-        # Release all tracked GPU tensors before closing transport
-        for key in list(self._pending_gpu_tensors):
-            for tid in self._pending_gpu_tensors.pop(key, []):
-                self.notify_gpu_tensor_consumed(tid)
-        for key in list(self._received_gpu_tensors):
-            for tid in self._received_gpu_tensors.pop(key, []):
-                self.notify_gpu_tensor_consumed(tid)
+        with self._state_lock:
+            pending_tids = [
+                tid
+                for key in list(self._pending_gpu_tensors)
+                for tid in self._pending_gpu_tensors.pop(key, [])
+            ]
+            received_tids = [
+                tid
+                for key in list(self._received_gpu_tensors)
+                for tid in self._received_gpu_tensors.pop(key, [])
+            ]
+        transport = self._transport
+        if transport is not None:
+            try:
+                if hasattr(transport, "release_many"):
+                    transport.release_many(pending_tids)
+                else:
+                    for tid in pending_tids:
+                        transport.release(tid)
+            except Exception:
+                pass
+        self.notify_gpu_tensors_consumed(received_tids)
+        self._shutdown_deferred_ack_thread()
         self._shm.close()
-        if self._transport is not None:
-            self._transport.close()
-            self._transport = None
+        with self._transport_lock:
+            if self._transport is not None:
+                if hasattr(self._transport, "close"):
+                    self._transport.close()
+                self._transport = None
 
     def set_ack_conns(self, ack_conn: Any, consumer_ack_conn: Any) -> None:
         """Wire ACK pipe connections after construction.
@@ -441,6 +621,11 @@ class UniIPCConnector(OmniConnectorBase):
         """
         self._ack_conn = ack_conn
         self._consumer_ack_conn = consumer_ack_conn
+        if self._transport is not None:
+            self._transport._ack_conn = ack_conn
+            self._transport._consumer_ack_conn = consumer_ack_conn
+            if ack_conn is not None and hasattr(self._transport, "_start_ack_thread"):
+                self._transport._start_ack_thread()
 
     @property
     def dst_device(self) -> str:
@@ -448,6 +633,8 @@ class UniIPCConnector(OmniConnectorBase):
         return f"cuda:{self._dst_device}"
 
     def health(self) -> dict[str, Any]:
+        with self._state_lock:
+            metrics = dict(self._metrics)
         result = {
             "status": "healthy",
             "transport_mode": self._transport_mode,
@@ -455,7 +642,7 @@ class UniIPCConnector(OmniConnectorBase):
             "dst_device": self._dst_device,
             "gpu_transport_min_bytes": self._gpu_transport_min_bytes,
             "gpu_memory_pressure_threshold": self._gpu_memory_pressure_threshold,
-            **self._metrics,
+            **metrics,
         }
         # Add real-time registry size if transport is active
         if self._transport is not None and hasattr(self._transport, 'registry_size'):

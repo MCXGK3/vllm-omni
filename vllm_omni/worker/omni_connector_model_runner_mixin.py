@@ -66,6 +66,73 @@ class OmniConnectorModelRunnerMixin:
     #  Init / Shutdown
     # ------------------------------------------------------------------ #
 
+    def _ensure_omni_runtime_state(self) -> None:
+        """Install default mixin runtime fields when init was skipped/delayed."""
+        if not hasattr(self, "_omni_connector"):
+            self._omni_connector = None
+        if not hasattr(self, "_omni_send_connector"):
+            self._omni_send_connector = None
+        if not hasattr(self, "_kv_transfer_manager"):
+            self._kv_transfer_manager = None
+
+        defaults = {
+            "_async_chunk": False,
+            "_model_mode": "ar",
+            "_stage_id": 0,
+            "_next_stage_id": 1,
+            "_from_tp": 1,
+            "_to_tp": 1,
+            "_local_rank": 0,
+            "_custom_process_func_path": None,
+            "_custom_process_func": None,
+            "_custom_process_supports_is_finished": None,
+        }
+        for name, value in defaults.items():
+            if not hasattr(self, name):
+                setattr(self, name, value)
+
+        mapping_defaults = {
+            "_put_req_chunk": defaultdict(int),
+            "_get_req_chunk": defaultdict(int),
+            "_send_side_request_payload": {},
+            "_code_prompt_token_ids": defaultdict(list),
+            "_request_ids_mapping": {},
+            "_pending_load_reqs": {},
+            "_finished_load_reqs": set(),
+            "_pending_save_reqs": {},
+            "_pending_save_counts": defaultdict(int),
+            "_deferred_send_cleanup": set(),
+            "_chunk_ready_req_ids": set(),
+            "_chunk_finished_req_ids": set(),
+            "_stage_recv_req_ids": set(),
+            "_full_payload_pending_broadcast_req_ids": set(),
+            "_async_chunk_updated_req_ids": set(),
+            "_local_stage_payload_cache": {},
+            "_local_stage_payload_get_keys": defaultdict(set),
+            "_local_request_metadata": {},
+            "_chunk_stream_completed": set(),
+            "_pending_full_payload_send": {},
+            "_kv_sent_req_ids": [],
+            "_kv_pending_transfers": {},
+            "_kv_active_transfers": set(),
+            "_kv_completed_transfers": set(),
+            "_kv_triggered_requests": set(),
+        }
+        for name, value in mapping_defaults.items():
+            if not hasattr(self, name):
+                setattr(self, name, value)
+
+        if not hasattr(self, "_lock"):
+            self._lock = threading.Lock()
+        if not hasattr(self, "_stop_event"):
+            self._stop_event = threading.Event()
+        if not hasattr(self, "_work_available"):
+            self._work_available = threading.Event()
+        if not hasattr(self, "_recv_thread"):
+            self._recv_thread = None
+        if not hasattr(self, "_save_thread"):
+            self._save_thread = None
+
     def init_omni_connectors(
         self,
         vllm_config: Any,
@@ -79,11 +146,23 @@ class OmniConnectorModelRunnerMixin:
             model_config: Stage-level model config with connector settings.
             kv_transfer_manager: Existing KV transfer manager to delegate to.
         """
+        self._ensure_omni_runtime_state()
         self._omni_connector: OmniConnectorBase | None = self._create_connector(model_config)
-        # Outbound connector always uses SharedMemoryConnector so that
-        # downstream stages that are not configured with UniIPC receive
-        # plain serialized payloads instead of __gpux__ markers.
+        # Use UniIPC bidirectionally when the edge is configured for it; otherwise
+        # keep the compatibility SHM sender for connectors that cannot reassemble
+        # GPU transport markers on the downstream side.
+        is_uniipc_connector = False
         if self._omni_connector is not None:
+            try:
+                from vllm_omni.distributed.omni_connectors.connectors.uniipc_connector import (
+                    UniIPCConnector,
+                )
+                is_uniipc_connector = isinstance(self._omni_connector, UniIPCConnector)
+            except Exception:
+                is_uniipc_connector = type(self._omni_connector).__name__ == "UniIPCConnector"
+        if self._omni_connector is not None and is_uniipc_connector:
+            self._omni_send_connector = self._omni_connector
+        elif self._omni_connector is not None:
             try:
                 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import (
                     SharedMemoryConnector,
@@ -162,6 +241,7 @@ class OmniConnectorModelRunnerMixin:
         # visibility and avoids mixing connector I/O with model runtime
         # ownership.
         self._local_stage_payload_cache: dict[str, dict[str, Any]] = {}
+        self._local_stage_payload_get_keys: dict[str, set[str]] = defaultdict(set)
         # Lightweight scheduling metadata pending delivery to the Scheduler.
         self._local_request_metadata: dict[str, dict[str, Any]] = {}
 
@@ -209,6 +289,7 @@ class OmniConnectorModelRunnerMixin:
 
     def shutdown_omni_connectors(self) -> None:
         """Stop background threads and release connector resources."""
+        self._ensure_omni_runtime_state()
         self._stop_event.set()
         if self._recv_thread is not None:
             self._recv_thread.join(timeout=5)
@@ -219,7 +300,8 @@ class OmniConnectorModelRunnerMixin:
                 self._omni_connector.close()
             except Exception:
                 pass
-        if getattr(self, "_omni_send_connector", None) is not None:
+        if (getattr(self, "_omni_send_connector", None) is not None
+                and self._omni_send_connector is not self._omni_connector):
             try:
                 self._omni_send_connector.close()
             except Exception:
@@ -233,6 +315,7 @@ class OmniConnectorModelRunnerMixin:
         request ID is resolved before cleaning up ``_put_req_chunk`` which
         is keyed by external ID.
         """
+        self._ensure_omni_runtime_state()
         ext_id = self._request_ids_mapping.pop(req_id, None)
         send_req_id = ext_id if ext_id is not None else req_id
 
@@ -248,12 +331,14 @@ class OmniConnectorModelRunnerMixin:
             self._kv_completed_transfers.discard(req_id)
             self._kv_triggered_requests.discard(req_id)
         # ACK GPU IPC tensors to release producer-side TensorRegistry entries
-        if self._omni_connector is not None:
-            self._omni_connector.release_gpu_tensors(send_req_id)
+        connector = getattr(self, "_omni_connector", None)
+        if connector is not None and hasattr(connector, "release_gpu_tensors"):
+            connector.release_gpu_tensors(send_req_id)
         self._cleanup_recv_delivery_state(req_id)
 
     def drop_inactive_request_delivery_state(self, req_id: str) -> None:
         """Clear recv-side state for inactive requests."""
+        self._ensure_omni_runtime_state()
         ext_id = self._request_ids_mapping.pop(req_id, None)
         drop_key = ext_id if ext_id is not None else req_id
         if hasattr(self, "_lock"):
@@ -262,8 +347,9 @@ class OmniConnectorModelRunnerMixin:
         else:
             self._drop_send_side_payload_state(req_id, ext_id)
         # ACK GPU IPC tensors to release producer-side TensorRegistry entries
-        if self._omni_connector is not None:
-            self._omni_connector.release_gpu_tensors(drop_key)
+        connector = getattr(self, "_omni_connector", None)
+        if connector is not None and hasattr(connector, "release_gpu_tensors"):
+            connector.release_gpu_tensors(drop_key)
         self._cleanup_recv_delivery_state(req_id)
 
     def _drop_send_side_payload_state(self, req_id: str, ext_id: str | None) -> None:
@@ -278,7 +364,8 @@ class OmniConnectorModelRunnerMixin:
         registries when a consumer exits or a release ACK is lost.
         Only meaningful when ``release_timeout_ms > 0`` on the transport.
         """
-        conn = self._omni_connector
+        self._ensure_omni_runtime_state()
+        conn = getattr(self, "_omni_connector", None)
         if conn is None:
             return
         transport = getattr(conn, "_transport", None)
@@ -298,6 +385,8 @@ class OmniConnectorModelRunnerMixin:
 
     def _cleanup_recv_delivery_state(self, req_id: str) -> None:
         """Clear recv-side delivery-cycle state."""
+        self._ensure_omni_runtime_state()
+        self.mark_stage_payload_consumed(req_id, wait_cuda_event=False)
         if hasattr(self, "_lock"):
             with self._lock:
                 self._clear_recv_delivery_state(req_id)
@@ -315,6 +404,8 @@ class OmniConnectorModelRunnerMixin:
         self._full_payload_pending_broadcast_req_ids.discard(req_id)
         self._async_chunk_updated_req_ids.discard(req_id)
         self._local_stage_payload_cache.pop(req_id, None)
+        if hasattr(self, "_local_stage_payload_get_keys"):
+            self._local_stage_payload_get_keys.pop(req_id, None)
         self._local_request_metadata.pop(req_id, None)
 
     def prune_inactive_requests(self, active_req_ids: Any) -> set[str]:
@@ -326,6 +417,7 @@ class OmniConnectorModelRunnerMixin:
         map, preventing background recv/send bookkeeping from outliving the
         request lifecycle.
         """
+        self._ensure_omni_runtime_state()
         if active_req_ids is None:
             return set()
 
@@ -398,22 +490,66 @@ class OmniConnectorModelRunnerMixin:
 
     def put_local_stage_payload(self, req_id: str, payload: dict[str, Any]) -> None:
         """Store a full stage payload in the local cache."""
+        self._ensure_omni_runtime_state()
         self._local_stage_payload_cache[req_id] = payload
+
+    def _ensure_stage_payload_key_state(self) -> None:
+        self._ensure_omni_runtime_state()
+        if not hasattr(self, "_local_stage_payload_get_keys"):
+            self._local_stage_payload_get_keys = defaultdict(set)
 
     def get_local_stage_payload(self, req_id: str) -> dict[str, Any] | None:
         """Read a stage payload without removing it."""
+        self._ensure_omni_runtime_state()
         return self._local_stage_payload_cache.get(req_id)
 
     def pop_local_stage_payload(self, req_id: str) -> dict[str, Any] | None:
         """Remove and return a stage payload (consume after use)."""
-        return self._local_stage_payload_cache.pop(req_id, None)
+        self._ensure_omni_runtime_state()
+        payload = self._local_stage_payload_cache.pop(req_id, None)
+        self.mark_stage_payload_consumed(req_id)
+        return payload
+
+    def track_stage_payload_get_key(self, req_id: str, get_key: str) -> None:
+        """Associate a received connector key with a local payload."""
+        self._ensure_stage_payload_key_state()
+        self._local_stage_payload_get_keys[req_id].add(get_key)
+
+    def mark_stage_payload_consumed(
+        self,
+        req_id: str,
+        *,
+        wait_cuda_event: bool = True,
+    ) -> None:
+        """Release CUDA IPC tensors backing one consumed local payload."""
+        self._ensure_stage_payload_key_state()
+        get_keys = self._local_stage_payload_get_keys.pop(req_id, set())
+        connector = getattr(self, "_omni_connector", None)
+        if connector is None or not hasattr(connector, "release_received_gpu_tensors"):
+            return
+        for get_key in get_keys:
+            try:
+                connector.release_received_gpu_tensors(
+                    get_key,
+                    wait_cuda_event=wait_cuda_event,
+                )
+            except Exception:
+                logger.debug(
+                    "[Stage-%s] mark_stage_payload_consumed failed req=%s key=%s",
+                    self._stage_id,
+                    req_id,
+                    get_key,
+                    exc_info=True,
+                )
 
     def put_local_request_metadata(self, req_id: str, metadata: dict[str, Any]) -> None:
         """Store lightweight scheduling metadata for a request."""
+        self._ensure_omni_runtime_state()
         self._local_request_metadata[req_id] = metadata
 
     def get_local_request_metadata(self, req_id: str) -> dict[str, Any] | None:
         """Retrieve scheduling metadata for a request."""
+        self._ensure_omni_runtime_state()
         return self._local_request_metadata.get(req_id)
 
     # ------------------------------------------------------------------ #
@@ -686,6 +822,7 @@ class OmniConnectorModelRunnerMixin:
         that has arrived, or ``None`` if nothing is ready.  Stores full
         payloads in the local cache and extracts scheduling metadata.
         """
+        self._ensure_omni_runtime_state()
         with self._lock:
             results = self._collect_full_payload_results_locked() if self.is_data_transfer_rank() else None
         results = self._broadcast_tp_payload_packet(results)
@@ -731,6 +868,7 @@ class OmniConnectorModelRunnerMixin:
         The data is actually sent when ``flush_full_payload_outputs`` is called
         with the finished request IDs from the next scheduler cycle.
         """
+        self._ensure_omni_runtime_state()
         # ---- Filter out all-zero tensors from the incoming pooler_output ----
         filtered: dict[str, Any] = {}
         dropped_zero_keys: list[tuple[str, tuple[int, ...]]] = []
@@ -776,6 +914,7 @@ class OmniConnectorModelRunnerMixin:
 
     def flush_full_payload_outputs(self, finished_req_ids: set[str]) -> None:
         """Send accumulated full_payload outputs for requests that just finished."""
+        self._ensure_omni_runtime_state()
         logger.info(
             "[Stage-%s] flush_full_payload_outputs: finished_req_ids=%s, pending=%s",
             self._stage_id,
@@ -806,7 +945,8 @@ class OmniConnectorModelRunnerMixin:
 
         Returns list of request IDs successfully enqueued.
         """
-        if self._omni_connector is None:
+        self._ensure_omni_runtime_state()
+        if getattr(self, "_omni_connector", None) is None:
             logger.info("[Stage-%s] send_full_payload_outputs: connector is None, skip", self._stage_id)
             return []
         if not self.is_data_transfer_rank():
@@ -917,6 +1057,7 @@ class OmniConnectorModelRunnerMixin:
         Skips requests whose batch data has already been received to
         prevent the bg thread from polling for non-existent chunks.
         """
+        self._ensure_omni_runtime_state()
         if self._stage_id == 0:
             return
         request_id = request.request_id
@@ -950,6 +1091,7 @@ class OmniConnectorModelRunnerMixin:
         thread, which may concurrently mutate the live cache entries via
         ``dict.update()``.
         """
+        self._ensure_omni_runtime_state()
         with self._lock:
             finished = set(self._finished_load_reqs)
             if not finished:
@@ -977,7 +1119,8 @@ class OmniConnectorModelRunnerMixin:
         ``connector.put()`` is done by the background save thread.
         Non-KV data is identical across TP ranks; only rank 0 sends.
         """
-        if self._omni_connector is None:
+        self._ensure_omni_runtime_state()
+        if getattr(self, "_omni_connector", None) is None:
             logger.warning("[Stage-%s] send_chunk: connector is None", self._stage_id)
             return False
         if not self.is_data_transfer_rank():
@@ -1047,6 +1190,7 @@ class OmniConnectorModelRunnerMixin:
 
         Delegates to the existing ``OmniKVTransferManager``.
         """
+        self._ensure_omni_runtime_state()
         if self._kv_transfer_manager is None:
             return list(finished_reqs.keys()) if finished_reqs else []
         with nvtx_range("omni:send_kv_cache"):
@@ -1070,6 +1214,7 @@ class OmniConnectorModelRunnerMixin:
 
         Delegates to the existing ``OmniKVTransferManager``.
         """
+        self._ensure_omni_runtime_state()
         if self._kv_transfer_manager is None:
             return None, 0
         with nvtx_range("omni:recv_kv_cache"):
@@ -1101,6 +1246,7 @@ class OmniConnectorModelRunnerMixin:
         companion payload fetch, and applying any model-specific CFG fields back
         onto ``req.sampling_params``.
         """
+        self._ensure_omni_runtime_state()
         if self._kv_transfer_manager is None:
             return False
 
@@ -1155,6 +1301,7 @@ class OmniConnectorModelRunnerMixin:
         For heterogeneous TP receive, the local rank is the target rank and must
         fetch one or more source-rank shards keyed as ``from_rank -> to_rank``.
         """
+        self._ensure_omni_runtime_state()
         remote_ranks = self.get_kv_remote_ranks()
         return [
             self.get_kv_connector_key(
@@ -1169,6 +1316,7 @@ class OmniConnectorModelRunnerMixin:
 
     def get_kv_target_ranks_for_send(self) -> list[int]:
         """Determine which target ranks this local rank should send KV shards to."""
+        self._ensure_omni_runtime_state()
         self._validate_kv_tp_topology()
         if self._from_tp == self._to_tp:
             return [self._local_rank]
@@ -1187,6 +1335,7 @@ class OmniConnectorModelRunnerMixin:
         chunk_id: int = 0,
     ) -> list[str]:
         """Build send-side connector keys for this rank's KV shard(s)."""
+        self._ensure_omni_runtime_state()
         target_ranks = self.get_kv_target_ranks_for_send()
         return [
             self.get_kv_connector_key(
@@ -1239,6 +1388,7 @@ class OmniConnectorModelRunnerMixin:
 
     def _slice_rank_sharded_kv_payload(self, payload: dict[str, Any] | None) -> dict[str, Any] | None:
         """Slice a duplicated source-rank KV shard for ``from_tp < to_tp`` cases."""
+        self._ensure_omni_runtime_state()
         if payload is None or self._from_tp >= self._to_tp:
             return payload
 
@@ -1280,6 +1430,7 @@ class OmniConnectorModelRunnerMixin:
         so only rank 0 transfers them.  KV payloads are rank-specific and
         all ranks participate.
         """
+        self._ensure_omni_runtime_state()
         return self._local_rank != 0
 
     def get_kv_rank_mapping(self) -> dict[str, Any]:
@@ -1288,6 +1439,7 @@ class OmniConnectorModelRunnerMixin:
         Useful for debugging and for downstream code that needs to know
         the TP topology without re-parsing model config.
         """
+        self._ensure_omni_runtime_state()
         return {
             "from_tp": self._from_tp,
             "to_tp": self._to_tp,
@@ -1312,6 +1464,7 @@ class OmniConnectorModelRunnerMixin:
         Called by the scheduler when a transfer trigger fires.  The mixin
         owns the lifecycle from this point: pending → active → completed.
         """
+        self._ensure_omni_runtime_state()
         if req_id in self._kv_pending_transfers:
             return
         self._kv_triggered_requests.add(req_id)
@@ -1329,6 +1482,7 @@ class OmniConnectorModelRunnerMixin:
         Returns ``{req_id: {seq_len, block_ids}}`` for the model runner
         to submit to ``send_kv_cache``.
         """
+        self._ensure_omni_runtime_state()
         if not self._kv_pending_transfers:
             return {}
         pending = dict(self._kv_pending_transfers)
@@ -1342,6 +1496,7 @@ class OmniConnectorModelRunnerMixin:
         Moves requests from active to completed so the scheduler can
         safely free their blocks.
         """
+        self._ensure_omni_runtime_state()
         for req_id in req_ids:
             self._kv_active_transfers.discard(req_id)
             self._kv_completed_transfers.add(req_id)
@@ -1351,16 +1506,19 @@ class OmniConnectorModelRunnerMixin:
 
         The scheduler calls this to know which requests' blocks can be freed.
         """
+        self._ensure_omni_runtime_state()
         completed = set(self._kv_completed_transfers)
         self._kv_completed_transfers.clear()
         return completed
 
     def is_kv_transfer_triggered(self, req_id: str) -> bool:
         """Check if a request has already triggered KV transfer."""
+        self._ensure_omni_runtime_state()
         return req_id in self._kv_triggered_requests
 
     def has_pending_kv_work(self) -> bool:
         """True if any KV transfers are pending, active, or awaiting ack."""
+        self._ensure_omni_runtime_state()
         return bool(self._kv_pending_transfers or self._kv_active_transfers or self._kv_completed_transfers)
 
     #  Output aggregation
@@ -1387,8 +1545,7 @@ class OmniConnectorModelRunnerMixin:
         Full payloads remain owned by the Model Runner local cache for all
         paths.
         """
-        if not hasattr(self, "_lock"):
-            return OmniConnectorOutput()
+        self._ensure_omni_runtime_state()
 
         tp_group = self._get_local_tp_group()
         if self._async_chunk and tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
@@ -1491,22 +1648,27 @@ class OmniConnectorModelRunnerMixin:
 
     @property
     def put_req_chunk(self) -> dict[str, int]:
+        self._ensure_omni_runtime_state()
         return self._put_req_chunk
 
     @property
     def request_payload(self) -> dict[str, dict[str, Any]]:
+        self._ensure_omni_runtime_state()
         return self._send_side_request_payload
 
     @request_payload.setter
     def request_payload(self, value: dict[str, dict[str, Any]]) -> None:
+        self._ensure_omni_runtime_state()
         self._send_side_request_payload = value
 
     @property
     def code_prompt_token_ids(self) -> dict[str, list[list[int]]]:
+        self._ensure_omni_runtime_state()
         return self._code_prompt_token_ids
 
     @property
     def connector(self) -> Any | None:
+        self._ensure_omni_runtime_state()
         return self._omni_connector
 
     # ------------------------------------------------------------------ #
@@ -1515,6 +1677,7 @@ class OmniConnectorModelRunnerMixin:
 
     def _recv_loop(self) -> None:
         """Background thread: poll connector for incoming data."""
+        self._ensure_omni_runtime_state()
         _recv_poll_count = 0
         while not self._stop_event.is_set():
             with self._lock:
@@ -1556,6 +1719,7 @@ class OmniConnectorModelRunnerMixin:
 
     def _save_loop(self) -> None:
         """Background thread: send outgoing data via connector."""
+        self._ensure_omni_runtime_state()
         while not self._stop_event.is_set():
             task = None
             with self._lock:
@@ -1589,6 +1753,7 @@ class OmniConnectorModelRunnerMixin:
 
     def _requeue_or_drop_failed_send(self, task: dict) -> None:
         """Re-enqueue a failed send task or drop it after max retries."""
+        self._ensure_omni_runtime_state()
         retry_count = task.get("_retry_count", 0) + 1
         req_id = task.get("request_id")
         if retry_count <= self._MAX_SEND_RETRIES:
@@ -1618,7 +1783,8 @@ class OmniConnectorModelRunnerMixin:
 
     def _poll_single_request(self, req_id: str) -> bool:
         """Poll connector for one chunk of a request (non-blocking)."""
-        connector = self._omni_connector
+        self._ensure_omni_runtime_state()
+        connector = getattr(self, "_omni_connector", None)
         if connector is None:
             return False
 
@@ -1699,6 +1865,7 @@ class OmniConnectorModelRunnerMixin:
                     existing.update(payload_data)
                 else:
                     self._local_stage_payload_cache[req_id] = payload_data
+                self.track_stage_payload_get_key(req_id, connector_get_key)
                 staged_payload = self._local_stage_payload_cache[req_id]
                 self._async_chunk_updated_req_ids.add(req_id)
                 self.put_local_request_metadata(req_id, self._extract_scheduling_metadata(staged_payload))
@@ -1731,6 +1898,7 @@ class OmniConnectorModelRunnerMixin:
                 engine_inputs = payload_data
             with self._lock:
                 self._local_stage_payload_cache[req_id] = self._snapshot_payload(engine_inputs)
+                self.track_stage_payload_get_key(req_id, connector_get_key)
                 # Publish full-payload readiness only after the aligned TP broadcast
                 # path in recv_full_payload_inputs() has materialized the payload on all
                 # local ranks. Publishing metadata / stage_recv from the background recv
@@ -1756,6 +1924,7 @@ class OmniConnectorModelRunnerMixin:
         pooling_output: Any | None,
     ) -> Any | None:
         """Run the custom process hook with a best-effort finished kwarg."""
+        self._ensure_omni_runtime_state()
         if self._custom_process_func is None:
             return None
 
@@ -1833,7 +2002,8 @@ class OmniConnectorModelRunnerMixin:
         # Use the outbound (SHM-only) connector so downstream stages that
         # do not use UniIPC receive plain serialized payloads, not __gpux__
         # markers that they cannot reassemble.
-        connector = getattr(self, "_omni_send_connector", None) or self._omni_connector
+        self._ensure_omni_runtime_state()
+        connector = getattr(self, "_omni_send_connector", None) or getattr(self, "_omni_connector", None)
         if connector is None:
             return True
 
@@ -1869,6 +2039,7 @@ class OmniConnectorModelRunnerMixin:
 
     def _decrement_pending_save_count(self, request_id: str) -> None:
         """Decrement pending save count and run deferred cleanup if zero."""
+        self._ensure_omni_runtime_state()
         cleanup_req_id = None
         with self._lock:
             remaining = self._pending_save_counts.get(request_id, 0)
@@ -1896,6 +2067,7 @@ class OmniConnectorModelRunnerMixin:
         ``_local_stage_payload_cache`` without aliasing the authoritative
         ``_send_side_request_payload`` dict.
         """
+        self._ensure_omni_runtime_state()
         if req_id not in self._send_side_request_payload:
             self._send_side_request_payload[req_id] = dict(payload_data)
             return dict(self._send_side_request_payload[req_id])
@@ -1977,6 +2149,7 @@ class OmniConnectorModelRunnerMixin:
         ``OmniGPUModelRunner`` can reuse it instead of open-coding the same
         inactive-request state mutations.
         """
+        self._ensure_omni_runtime_state()
         if hasattr(self, "model_intermediate_buffer"):
             self.model_intermediate_buffer.pop(req_id, None)
         self.drop_inactive_request_delivery_state(req_id)
@@ -2144,6 +2317,7 @@ class OmniConnectorModelRunnerMixin:
         ``external_req_id`` attribute, and finally to the given
         ``fallback_req_id``.
         """
+        self._ensure_omni_runtime_state()
         mapped = self._request_ids_mapping.get(fallback_req_id)
         if mapped is not None:
             return mapped
@@ -2157,6 +2331,7 @@ class OmniConnectorModelRunnerMixin:
         Falls back to ``stage_id + 1`` when the config does not specify
         a ``to_stage`` explicitly.
         """
+        self._ensure_omni_runtime_state()
         connector_config = getattr(model_config, "stage_connector_config", None)
         if connector_config is not None:
             if isinstance(connector_config, dict):
@@ -2201,6 +2376,7 @@ class OmniConnectorModelRunnerMixin:
 
     def _validate_kv_tp_topology(self) -> None:
         """Reject heterogeneous TP mappings that cannot be routed losslessly."""
+        self._ensure_omni_runtime_state()
         if self._from_tp <= 0 or self._to_tp <= 0:
             raise ValueError(f"Invalid KV TP mapping: from_tp={self._from_tp}, to_tp={self._to_tp}")
         larger = max(self._from_tp, self._to_tp)
@@ -2218,6 +2394,7 @@ class OmniConnectorModelRunnerMixin:
         - ``from_tp < to_tp``: multiple to-ranks read from the same from-rank
         - ``from_tp == to_tp``: 1:1 mapping
         """
+        self._ensure_omni_runtime_state()
         self._validate_kv_tp_topology()
         if self._from_tp == self._to_tp:
             return [self._local_rank]
@@ -2237,6 +2414,7 @@ class OmniConnectorModelRunnerMixin:
         so the connector leader matches TP-local broadcast source rank.
         Otherwise fall back to LOCAL_RANK==0 for the single-rank case.
         """
+        self._ensure_omni_runtime_state()
         tp_group = self._get_local_tp_group()
         if tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
             return getattr(tp_group, "rank_in_group", 0) == 0
@@ -2251,4 +2429,5 @@ class OmniConnectorModelRunnerMixin:
         to_rank: int,
     ) -> str:
         """Build connector key that includes rank info for KV transfers."""
+        self._ensure_omni_runtime_state()
         return f"{req_id}_{from_stage}_{chunk_id}_{from_rank}_{to_rank}"

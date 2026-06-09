@@ -34,6 +34,8 @@ class CudaCopyTransport:
         self._registry = TensorRegistry(timeout_ms=config.release_timeout_ms)
         self._ipc_args_store: dict[str, tuple] = {}
         self._copy_streams: dict[str, torch.cuda.Stream] = {}
+        self._store_lock = threading.Lock()
+        self._stream_lock = threading.Lock()
         if config.enable_peer_access:
             self._ensure_peer_access(config.src_device, config.dst_device)
 
@@ -42,6 +44,7 @@ class CudaCopyTransport:
         self._consumer_ack_conn: Connection | None = getattr(config, 'consumer_ack_conn', None)
         self._ack_thread: threading.Thread | None = None
         self._ack_running = False
+        self._ack_lock = threading.Lock()
         self._start_ack_thread()
 
     @staticmethod
@@ -76,6 +79,8 @@ class CudaCopyTransport:
             lib.cudaSetDevice.restype = ctypes.c_int
             lib.cudaDeviceEnablePeerAccess.argtypes = [ctypes.c_int, ctypes.c_uint]
             lib.cudaDeviceEnablePeerAccess.restype = ctypes.c_int
+            lib.cudaGetLastError.argtypes = []
+            lib.cudaGetLastError.restype = ctypes.c_int
             CudaCopyTransport._libcudart = lib
 
         lib = CudaCopyTransport._libcudart
@@ -94,7 +99,14 @@ class CudaCopyTransport:
                                 "cudaSetDevice(%d) failed: %d", i, err)
                             continue
                         err = lib.cudaDeviceEnablePeerAccess(j, 0)
-                        if err != 0:
+                        if err in (217, 704):
+                            lib.cudaGetLastError()
+                            logger.debug(
+                                "cudaDeviceEnablePeerAccess(%d->%d): already enabled",
+                                i, j,
+                            )
+                        elif err != 0:
+                            lib.cudaGetLastError()
                             logger.warning(
                                 "cudaDeviceEnablePeerAccess(%d->%d): cudaError=%d",
                                 i, j, err,
@@ -137,16 +149,18 @@ class CudaCopyTransport:
 
     def _start_ack_thread(self) -> None:
         """Start the ACK thread if ack_conn is set. Idempotent."""
-        if self._ack_conn is not None and not self._ack_running:
-            self._ack_running = True
-            self._ack_thread = threading.Thread(target=self._ack_loop, daemon=True)
-            self._ack_thread.start()
+        with self._ack_lock:
+            if self._ack_conn is not None and not self._ack_running:
+                self._ack_running = True
+                self._ack_thread = threading.Thread(target=self._ack_loop, daemon=True)
+                self._ack_thread.start()
 
     def _get_copy_stream(self, device: str) -> torch.cuda.Stream:
-        if device not in self._copy_streams:
-            self._copy_streams[device] = torch.cuda.Stream(
-                device=torch.device(device))
-        return self._copy_streams[device]
+        with self._stream_lock:
+            if device not in self._copy_streams:
+                self._copy_streams[device] = torch.cuda.Stream(
+                    device=torch.device(device))
+            return self._copy_streams[device]
 
     def send(
         self,
@@ -186,7 +200,8 @@ class CudaCopyTransport:
         metadata.ipc_args = ipc_args
 
         self._registry.register(tid, tensor)
-        self._ipc_args_store[tid] = ipc_args
+        with self._store_lock:
+            self._ipc_args_store[tid] = ipc_args
 
         logger.debug(
             "send: id=%s shape=%s dtype=%s nbytes=%d sync_ms=%.3f ipc_ms=%.3f",
@@ -281,31 +296,46 @@ class CudaCopyTransport:
                 continue
             if msg.get("type") == "shutdown":
                 break
-            tensor_id = msg.get("tensor_id", "")
-            if tensor_id:
-                logger.debug("ack_thread: releasing id=%s", tensor_id)
-                self.release(tensor_id)
+            tensor_ids = msg.get("tensor_ids")
+            if tensor_ids is None:
+                tensor_id = msg.get("tensor_id", "")
+                tensor_ids = [tensor_id] if tensor_id else []
+            if tensor_ids:
+                logger.debug("ack_thread: releasing %d ids", len(tensor_ids))
+                self.release_many(tensor_ids)
 
     def shutdown_ack_thread(self) -> None:
         """Signal the ACK thread to stop (does not join)."""
         self._ack_running = False
 
     def release(self, tensor_id: str) -> None:
-        self._ipc_args_store.pop(tensor_id, None)
+        with self._store_lock:
+            self._ipc_args_store.pop(tensor_id, None)
         self._registry.release(tensor_id)
+
+    def release_many(self, tensor_ids: list[str]) -> None:
+        if not tensor_ids:
+            return
+        with self._store_lock:
+            for tensor_id in tensor_ids:
+                self._ipc_args_store.pop(tensor_id, None)
+        self._registry.release_many(tensor_ids)
 
     def close(self) -> None:
         self.shutdown_ack_thread()
         if self._ack_thread is not None and self._ack_thread.is_alive():
             self._ack_thread.join(timeout=2.0)
-        self._ipc_args_store.clear()
+        with self._store_lock:
+            self._ipc_args_store.clear()
         self._registry.clear()
-        for s in self._copy_streams.values():
+        with self._stream_lock:
+            streams = list(self._copy_streams.values())
+            self._copy_streams.clear()
+        for s in streams:
             try:
                 s.synchronize()
             except Exception:
                 pass
-        self._copy_streams.clear()
 
     def cleanup_timeouts(self) -> list[str]:
         return self._registry.cleanup_timeouts()
