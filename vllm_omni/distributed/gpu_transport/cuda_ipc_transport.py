@@ -9,6 +9,7 @@ Producer retains the tensor until consumer sends release ACK.
 """
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import uuid
@@ -136,19 +137,14 @@ class CudaIpcTransport:
             tensor = tensor.contiguous()
 
         tid = tensor_id or uuid.uuid4().hex[:12]
-        t0 = time.perf_counter()
-        # Ensure the tensor's data is visible before we extract the IPC
-        # handle.  Use a CUDA event on the tensor's stream rather than
-        # a full device synchronize — this limits the stall to kernels
-        # queued on this specific stream and allows other streams to
-        # make progress concurrently.
+        _debug = logger.isEnabledFor(logging.DEBUG)
+        t0 = time.perf_counter() if _debug else 0.0
         stream = torch.cuda.current_stream(tensor.device)
         event = torch.cuda.Event(blocking=False)
         event.record(stream)
         event.synchronize()
-        t1 = time.perf_counter()
         ipc_args = extract_ipc_args(tensor)
-        t2 = time.perf_counter()
+        t2 = time.perf_counter() if _debug else 0.0
 
         metadata = TensorMetadata.from_tensor(
             tensor,
@@ -186,11 +182,12 @@ class CudaIpcTransport:
         if ipc_args is None:
             raise ValueError("TransportHandle has no IPC args — was metadata set by caller?")
 
-        t0 = time.perf_counter()
+        _debug = logger.isEnabledFor(logging.DEBUG)
+        t0 = time.perf_counter() if _debug else 0.0
         dst_dev = torch.device(dst_device) if isinstance(dst_device, str) else dst_device
         with torch.cuda.device(dst_dev):
             tensor = rebuild_from_ipc_args(ipc_args)
-        t1 = time.perf_counter()
+        t1 = time.perf_counter() if _debug else 0.0
 
         logger.debug(
             "recv: id=%s shape=%s dtype=%s rebuild_ms=%.3f",

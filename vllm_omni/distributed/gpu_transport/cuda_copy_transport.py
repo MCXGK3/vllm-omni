@@ -10,6 +10,7 @@ Consumer uses its local copy — no further dependency on producer allocation.
 """
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import uuid
@@ -146,14 +147,15 @@ class CudaCopyTransport:
             tensor = tensor.contiguous()
 
         tid = tensor_id or uuid.uuid4().hex[:12]
-        t0 = time.perf_counter()
+        _debug = logger.isEnabledFor(logging.DEBUG)
+        t0 = time.perf_counter() if _debug else 0.0
         stream = torch.cuda.current_stream(tensor.device)
         event = torch.cuda.Event(blocking=False)
         event.record(stream)
         event.synchronize()
-        t1 = time.perf_counter()
+        t1 = time.perf_counter() if _debug else 0.0
         ipc_args = extract_ipc_args(tensor)
-        t2 = time.perf_counter()
+        t2 = time.perf_counter() if _debug else 0.0
 
         metadata = TensorMetadata.from_tensor(
             tensor,
@@ -194,16 +196,17 @@ class CudaCopyTransport:
 
         dst_dev = torch.device(dst_device) if isinstance(dst_device, str) else dst_device
 
-        t0 = time.perf_counter()
+        _debug = logger.isEnabledFor(logging.DEBUG)
+        t0 = time.perf_counter() if _debug else 0.0
         # 1. Open IPC allocation (zero-copy view of producer memory)
         with torch.cuda.device(dst_dev):
             src_tensor = rebuild_from_ipc_args(ipc_args)
-        t1 = time.perf_counter()
+        t1 = time.perf_counter() if _debug else 0.0
 
         # 2. Allocate local tensor on dst_device
         torch_dtype = getattr(torch, meta.dtype.replace("torch.", ""))
         local_tensor = torch.empty(meta.shape, dtype=torch_dtype, device=dst_dev)
-        t2 = time.perf_counter()
+        t2 = time.perf_counter() if _debug else 0.0
 
         # 3. Async P2P copy on dedicated stream, then synchronize
         copy_stream = self._get_copy_stream(str(dst_dev))
@@ -212,7 +215,7 @@ class CudaCopyTransport:
             copy_event = torch.cuda.Event()
             copy_event.record(copy_stream)
         copy_event.synchronize()
-        t3 = time.perf_counter()
+        t3 = time.perf_counter() if _debug else 0.0
 
         # 4. Send copy_done ACK so producer can release the original tensor
         if self._consumer_ack_conn is not None:
