@@ -44,6 +44,7 @@ from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
+from vllm_omni.distributed.gpu_transport.IPCTensor import IPCTensor
 
 logger = init_logger(__name__)
 
@@ -958,6 +959,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         start,
                         end,
                     )
+                if get_tp_group().is_first_rank and req_hidden_states.shape[0]>=1:
+                    # logger.info(f"make IPCTensor for {req_hidden_states}")
+                    # req_hidden_states=IPCTensor(req_hidden_states)
+                    pass
                 payload: dict[str, object] = {"hidden": req_hidden_states}
 
                 mm_payload: dict[str, object] = {}
@@ -1004,6 +1009,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 # Flatten nested dicts to dotted keys so pooling_output
                 # stays dict[str, torch.Tensor] for msgspec serialization.
                 pooler_output.append(flatten_payload(payload))
+                if get_tp_group().is_first_rank:
+                    pooler_output=IPCTensor.wrap_cuda_tensors(pooler_output)
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.routed_experts_initialized:
                 capturer = RoutedExpertsCapturer.get_instance()
