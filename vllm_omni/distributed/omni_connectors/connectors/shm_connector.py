@@ -10,6 +10,7 @@ from vllm_omni.entrypoints.stage_utils import shm_read_bytes, shm_write_bytes
 
 from ..utils.logging import get_connector_logger
 from .base import OmniConnectorBase
+import nvtx
 
 logger = get_connector_logger(__name__)
 
@@ -49,6 +50,7 @@ class SharedMemoryConnector(OmniConnectorBase):
             # Always serialize first to check size (and for SHM writing)
             payload = self.serialize_obj(data)
             size = len(payload)
+            nvtx.push_range(f"SHM put {put_key} ({size} bytes)", color="purple")
 
             # Currently, we always use SHM.
             if True:
@@ -70,11 +72,12 @@ class SharedMemoryConnector(OmniConnectorBase):
 
             self._metrics["puts"] += 1
             self._metrics["bytes_transferred"] += size
-
+            nvtx.pop_range()
             return True, size, metadata
 
         except Exception as e:
             logger.error(f"SharedMemoryConnector put failed for req {put_key}: {e}")
+            nvtx.pop_range()
             return False, 0, None
 
     def _get_data_with_lock(self, lock_file: str, shm_handle: dict):
@@ -123,35 +126,36 @@ class SharedMemoryConnector(OmniConnectorBase):
         get_key: str,
         metadata=None,
     ) -> tuple[Any, int] | None:
-        if metadata is not None:
-            if isinstance(metadata, dict) and get_key in metadata:
-                metadata = metadata.get(get_key)
+        with nvtx.annotate(f"SHM get {get_key}", color="purple"):
+            if metadata is not None:
+                if isinstance(metadata, dict) and get_key in metadata:
+                    metadata = metadata.get(get_key)
 
-            if not isinstance(metadata, dict):
+                if not isinstance(metadata, dict):
+                    return self._get_by_key(get_key)
+
+                if "inline_bytes" in metadata:
+                    try:
+                        obj = self.deserialize_obj(metadata["inline_bytes"])
+                        self._pending_keys.discard(get_key)
+                        return obj, int(metadata.get("size", 0))
+                    except Exception as e:
+                        logger.error(f"SharedMemoryConnector inline get failed for req {get_key}: {e}")
+                        return None
+
+                if "shm" in metadata:
+                    shm_handle = metadata["shm"]
+                    lock_file = f"/dev/shm/shm_{shm_handle['name']}_lockfile.lock"
+                    result = self._get_data_with_lock(lock_file, shm_handle)
+                    if result is not None:
+                        self._pending_keys.discard(get_key)
+                    return result
+
+                # Metadata is a dict but has no SHM-specific handle (e.g. RDMA-
+                # style source_host/source_port).  Fall back to key-based read.
                 return self._get_by_key(get_key)
 
-            if "inline_bytes" in metadata:
-                try:
-                    obj = self.deserialize_obj(metadata["inline_bytes"])
-                    self._pending_keys.discard(get_key)
-                    return obj, int(metadata.get("size", 0))
-                except Exception as e:
-                    logger.error(f"SharedMemoryConnector inline get failed for req {get_key}: {e}")
-                    return None
-
-            if "shm" in metadata:
-                shm_handle = metadata["shm"]
-                lock_file = f"/dev/shm/shm_{shm_handle['name']}_lockfile.lock"
-                result = self._get_data_with_lock(lock_file, shm_handle)
-                if result is not None:
-                    self._pending_keys.discard(get_key)
-                return result
-
-            # Metadata is a dict but has no SHM-specific handle (e.g. RDMA-
-            # style source_host/source_port).  Fall back to key-based read.
             return self._get_by_key(get_key)
-
-        return self._get_by_key(get_key)
 
     def cleanup(self, request_id: str) -> None:
         """Best-effort cleanup of unconsumed SHM segments for *request_id*.

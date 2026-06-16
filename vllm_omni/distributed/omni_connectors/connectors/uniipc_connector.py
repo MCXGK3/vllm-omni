@@ -18,6 +18,7 @@ from typing import Any
 from ..utils.logging import get_connector_logger
 from .base import OmniConnectorBase
 from .shm_connector import SharedMemoryConnector
+import nvtx
 
 logger = get_connector_logger(__name__)
 
@@ -369,39 +370,40 @@ class UniIPCConnector(OmniConnectorBase):
         data: Any,
     ) -> tuple[bool, int, dict[str, Any] | None]:
         """Split GPU tensors, delegate metadata to SHM connector."""
-        t0 = time.perf_counter()
-        tensor_ids = None
-        timing = {}
-        try:
-            t_split_start = time.perf_counter()
-            stripped, tensor_ids = self._split(data)
-            timing["split_ms"] = (time.perf_counter() - t_split_start) * 1000.0
-            if tensor_ids:
+        with nvtx.annotate(f"UniIPC put {put_key}", color="grey"):
+            t0 = time.perf_counter()
+            tensor_ids = None
+            timing = {}
+            try:
+                t_split_start = time.perf_counter()
+                stripped, tensor_ids = self._split(data)
+                timing["split_ms"] = (time.perf_counter() - t_split_start) * 1000.0
+                if tensor_ids:
+                    with self._state_lock:
+                        self._pending_gpu_tensors[put_key] = tensor_ids
+                t_shm_start = time.perf_counter()
+                success, size, metadata = self._shm.put(
+                    from_stage, to_stage, put_key, stripped)
+                timing["shm_put_ms"] = (time.perf_counter() - t_shm_start) * 1000.0
+                if not success:
+                    self._release_registered_tensors(put_key, tensor_ids)
+                    return False, 0, None
+                timing["put_total_ms"] = (time.perf_counter() - t0) * 1000.0
                 with self._state_lock:
-                    self._pending_gpu_tensors[put_key] = tensor_ids
-            t_shm_start = time.perf_counter()
-            success, size, metadata = self._shm.put(
-                from_stage, to_stage, put_key, stripped)
-            timing["shm_put_ms"] = (time.perf_counter() - t_shm_start) * 1000.0
-            if not success:
+                    self._metrics["puts"] += 1
+                    self._metrics["bytes_transferred"] += size
+                    self._metrics["put_total_ms"] += timing["put_total_ms"]
+                if tensor_ids:
+                    logger.debug(
+                        "TIMING put: key=%s total=%.3fms split=%.3fms shm=%.3fms size=%d num_tids=%d",
+                        put_key, timing["put_total_ms"], timing["split_ms"],
+                        timing["shm_put_ms"], size, len(tensor_ids or []),
+                    )
+                return True, size, metadata
+            except Exception:
+                logger.exception("UniIPC put failed for key=%s", put_key)
                 self._release_registered_tensors(put_key, tensor_ids)
                 return False, 0, None
-            timing["put_total_ms"] = (time.perf_counter() - t0) * 1000.0
-            with self._state_lock:
-                self._metrics["puts"] += 1
-                self._metrics["bytes_transferred"] += size
-                self._metrics["put_total_ms"] += timing["put_total_ms"]
-            if tensor_ids:
-                logger.debug(
-                    "TIMING put: key=%s total=%.3fms split=%.3fms shm=%.3fms size=%d num_tids=%d",
-                    put_key, timing["put_total_ms"], timing["split_ms"],
-                    timing["shm_put_ms"], size, len(tensor_ids or []),
-                )
-            return True, size, metadata
-        except Exception:
-            logger.exception("UniIPC put failed for key=%s", put_key)
-            self._release_registered_tensors(put_key, tensor_ids)
-            return False, 0, None
 
     def _release_registered_tensors(
         self, put_key: str, tensor_ids: list[str] | None,
@@ -431,43 +433,44 @@ class UniIPCConnector(OmniConnectorBase):
         The rebuilt tensor is a zero-copy view of producer memory, so
         producer-side lifetime must cover downstream GPU work.
         """
-        t0 = time.perf_counter()
-        timing = {}
-        try:
-            t_shm_start = time.perf_counter()
-            result = self._shm.get(from_stage, to_stage, get_key, metadata)
-            timing["shm_get_ms"] = (time.perf_counter() - t_shm_start) * 1000.0
-            if result is None:
-                return None
-            obj, size = result
-            # Reassembly collects tensor IDs during the walk.  The
-            # _has_markers check here informs _reassemble so it can
-            # skip a redundant full-payload walk.
-            has_markers_flag = self._has_markers(obj)
-            t_reassemble_start = time.perf_counter()
-            obj, tensor_ids = self._reassemble(obj, skip_marker_check=has_markers_flag)
-            timing["reassemble_ms"] = (time.perf_counter() - t_reassemble_start) * 1000.0
-            if tensor_ids and self._transport_mode == "cuda_ipc":
+        with nvtx.annotate(f"UniIPC get {get_key}", color="grey"):
+            t0 = time.perf_counter()
+            timing = {}
+            try:
+                t_shm_start = time.perf_counter()
+                result = self._shm.get(from_stage, to_stage, get_key, metadata)
+                timing["shm_get_ms"] = (time.perf_counter() - t_shm_start) * 1000.0
+                if result is None:
+                    return None
+                obj, size = result
+                # Reassembly collects tensor IDs during the walk.  The
+                # _has_markers check here informs _reassemble so it can
+                # skip a redundant full-payload walk.
+                has_markers_flag = self._has_markers(obj)
+                t_reassemble_start = time.perf_counter()
+                obj, tensor_ids = self._reassemble(obj, skip_marker_check=has_markers_flag)
+                timing["reassemble_ms"] = (time.perf_counter() - t_reassemble_start) * 1000.0
+                if tensor_ids and self._transport_mode == "cuda_ipc":
+                    with self._state_lock:
+                        self._received_gpu_tensors[get_key] = tensor_ids
+                    timing["ack_ms"] = 0.0
+                else:
+                    timing["ack_ms"] = 0.0
+                timing["get_total_ms"] = (time.perf_counter() - t0) * 1000.0
                 with self._state_lock:
-                    self._received_gpu_tensors[get_key] = tensor_ids
-                timing["ack_ms"] = 0.0
-            else:
-                timing["ack_ms"] = 0.0
-            timing["get_total_ms"] = (time.perf_counter() - t0) * 1000.0
-            with self._state_lock:
-                self._metrics["gets"] += 1
-                self._metrics["get_total_ms"] += timing["get_total_ms"]
-            if has_markers_flag:
-                logger.debug(
-                    "TIMING get: key=%s total=%.3fms shm=%.3fms reassemble=%.3fms ack=%.3fms num_tids=%d",
-                    get_key, timing["get_total_ms"], timing["shm_get_ms"],
-                    timing["reassemble_ms"], timing["ack_ms"],
-                    len(tensor_ids or []),
-                )
-            return obj, size
-        except Exception:
-            logger.exception("UniIPC get failed for key=%s", get_key)
-            return None
+                    self._metrics["gets"] += 1
+                    self._metrics["get_total_ms"] += timing["get_total_ms"]
+                if has_markers_flag:
+                    logger.debug(
+                        "TIMING get: key=%s total=%.3fms shm=%.3fms reassemble=%.3fms ack=%.3fms num_tids=%d",
+                        get_key, timing["get_total_ms"], timing["shm_get_ms"],
+                        timing["reassemble_ms"], timing["ack_ms"],
+                        len(tensor_ids or []),
+                    )
+                return obj, size
+            except Exception:
+                logger.exception("UniIPC get failed for key=%s", get_key)
+                return None
 
     def release_gpu_tensors(self, request_id: str) -> None:
         """Release GPU transport tensors for *request_id*.

@@ -1474,17 +1474,18 @@ class OmniGPUModelRunner(GPUModelRunner):
         return model_output
 
     def _store_value(self, dest: dict, key: str, value: Any, gpu_keys: set) -> None:
-        if isinstance(value, torch.Tensor):
-            if key in gpu_keys:
-                dest[key] = value.detach().clone()
+        with nvtx_range(f"store_value for {key}"):
+            if isinstance(value, torch.Tensor):
+                if key in gpu_keys:
+                    dest[key] = value.detach().clone()
+                else:
+                    dest[key] = value.detach().to("cpu").contiguous()
+            elif isinstance(value, list):
+                dest[key] = [
+                    (item.detach().to("cpu").contiguous() if isinstance(item, torch.Tensor) else item) for item in value
+                ]
             else:
-                dest[key] = value.detach().to("cpu").contiguous()
-        elif isinstance(value, list):
-            dest[key] = [
-                (item.detach().to("cpu").contiguous() if isinstance(item, torch.Tensor) else item) for item in value
-            ]
-        else:
-            dest[key] = value
+                dest[key] = value
 
     def _update_intermediate_buffer(self, req_id: str, upd: dict) -> None:
         if not isinstance(upd, dict) or not upd:
