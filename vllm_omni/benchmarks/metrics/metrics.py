@@ -29,12 +29,15 @@ class MultiModalsBenchmarkMetrics(BenchmarkMetrics):
     mean_audio_e2el_ms: float = 0.0
     median_audio_e2el_ms: float = 0.0
     std_audio_e2el_ms: float = 0.0
+    percentiles_audio_e2el_ms: list[tuple[float, float]] = None
     mean_audio_itl_ms: float = 0.0
     median_audio_itl_ms: float = 0.0
     std_audio_itl_ms: float = 0.0
+    percentiles_audio_itl_ms: list[tuple[float, float]] = None
     mean_audio_text_gap_ms: float = 0.0
     median_audio_text_gap_ms: float = 0.0
     std_audio_text_gap_ms: float = 0.0
+    percentiles_audio_text_gap_ms: list[tuple[float, float]] = None
     mean_pipeline_ratio: float = 0.0
 
 
@@ -122,6 +125,9 @@ def process_one_metric(
         "audio_ttfp": "Time to First Packet",
         "audio_rtf": "Real Time Factor",
         "audio_duration": "Audio Duration",
+        "audio_e2el": "Audio End-to-end Latency",
+        "audio_itl": "Audio Inter-token Latency",
+        "audio_text_gap": "Text-Audio Gap",
     }
 
     header = metric_header_map.get(metric_attribute_name, metric_attribute_name)
@@ -363,12 +369,15 @@ def calculate_metrics(
         mean_audio_e2el_ms=np.mean(audio_e2els or 0) * 1000,
         median_audio_e2el_ms=np.median(audio_e2els or 0) * 1000,
         std_audio_e2el_ms=np.std(audio_e2els or 0) * 1000,
+        percentiles_audio_e2el_ms=[(p, np.percentile(audio_e2els or 0, p) * 1000) for p in selected_percentiles],
         mean_audio_itl_ms=np.mean(audio_itls_flat or 0) * 1000,
         median_audio_itl_ms=np.median(audio_itls_flat or 0) * 1000,
         std_audio_itl_ms=np.std(audio_itls_flat or 0) * 1000,
+        percentiles_audio_itl_ms=[(p, np.percentile(audio_itls_flat or 0, p) * 1000) for p in selected_percentiles],
         mean_audio_text_gap_ms=np.mean(audio_text_gaps or 0) * 1000,
         median_audio_text_gap_ms=np.median(audio_text_gaps or 0) * 1000,
         std_audio_text_gap_ms=np.std(audio_text_gaps or 0) * 1000,
+        percentiles_audio_text_gap_ms=[(p, np.percentile(audio_text_gaps or 0, p) * 1000) for p in selected_percentiles],
         mean_pipeline_ratio=np.mean([g/t if t > 0 else 0 for g, t in zip(ttfts, audio_ttfps)]) if ttfts and audio_ttfps else 0.0,
         mean_tpot_ms=np.mean(tpots or 0) * 1000,
         std_tpot_ms=np.std(tpots or 0) * 1000,

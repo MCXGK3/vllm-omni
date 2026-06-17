@@ -989,6 +989,14 @@ async def benchmark(
         # metric.
         if metric_attribute_name not in selected_percentile_metrics:
             return
+        _add_metric_to_result(metric_attribute_name)
+
+    def _add_metric_to_result(
+        # E.g., "ttft" or "audio_e2el"
+        metric_attribute_name: str,
+    ):
+        # Unconditionally add mean/median/std/percentiles for *one* metric
+        # into the result dict.  This does NOT consult selected_percentile_metrics.
         is_audio_rtf = metric_attribute_name == "audio_rtf"
         is_audio_duration = metric_attribute_name == "audio_duration"
 
@@ -997,6 +1005,7 @@ async def benchmark(
             suffix = "_s"
         elif is_audio_rtf:
             suffix = ""
+
         mean_attr_name = f"mean_{metric_attribute_name}{suffix}"
         mean_value = getattr(metrics, mean_attr_name, 0.0)
         result[mean_attr_name] = mean_value
@@ -1004,13 +1013,32 @@ async def benchmark(
         median_attr_name = f"median_{metric_attribute_name}{suffix}"
         median_value = getattr(metrics, median_attr_name, 0.0)
         result[median_attr_name] = median_value
-        for p, value in getattr(metrics, f"percentiles_{metric_attribute_name}{suffix}"):
+
+        std_attr_name = f"std_{metric_attribute_name}{suffix}"
+        std_value = getattr(metrics, std_attr_name, 0.0)
+        result[std_attr_name] = std_value
+
+        for p, value in getattr(metrics, f"percentiles_{metric_attribute_name}{suffix}", []):
             p_word = str(int(p)) if int(p) == p else str(p)
             result[f"p{p_word}_{metric_attribute_name}{suffix}"] = value
+
+    # Audio metrics that are always included in the result dict so they
+    # flow into saved JSON / CSV, regardless of --percentile-metrics.
+    _ALWAYS_AUDIO_METRICS: list[str] = [
+        "audio_ttfp",
+        "audio_rtf",
+        "audio_duration",
+        "audio_e2el",
+        "audio_itl",
+        "audio_text_gap",
+    ]
 
     if task_type == TaskType.GENERATION:
         for metric in selected_percentile_metrics:
             process_one_metric(metric)
+        # Always include all audio aggregated metrics in the result dict.
+        for audio_metric in _ALWAYS_AUDIO_METRICS:
+            _add_metric_to_result(audio_metric)
     else:
         process_one_metric("e2el")
 
