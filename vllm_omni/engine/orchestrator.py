@@ -457,99 +457,100 @@ class Orchestrator:
         while not self._shutdown_event.is_set():
             idle = True
             for stage_id in range(self.num_stages):
-                pool = self.stage_pools[stage_id]
-                for replica_id in range(pool.num_replicas):
-                    if self._shutdown_event.is_set():
-                        return
+                with nvtx_range(f"_orchestration_loop for stage{stage_id}"):
+                    pool = self.stage_pools[stage_id]
+                    for replica_id in range(pool.num_replicas):
+                        if self._shutdown_event.is_set():
+                            return
 
-                    if pool.stage_type == "diffusion":
-                        with nvtx_range("orchestrator:poll_diffusion_output"):
-                            output = pool.poll_diffusion_output(replica_id)
-                        if output is None:
-                            continue
-
-                        await self._handle_processed_outputs(stage_id, replica_id, [output])
-                        idle = False
-                    else:
-                        try:
-                            with nvtx_range("orchestrator:poll_llm_output"):
-                                raw_outputs = await pool.poll_llm_raw_output(replica_id, timeout_s=0.001)
-                            if raw_outputs is None:
+                        if pool.stage_type == "diffusion":
+                            with nvtx_range("orchestrator:poll_diffusion_output"):
+                                output = pool.poll_diffusion_output(replica_id)
+                            if output is None:
                                 continue
 
-                            await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
-                            for eco in raw_outputs.outputs:
-                                req_state = self.request_states.get(getattr(eco, "request_id", None))
-                                if req_state is None:
+                            await self._handle_processed_outputs(stage_id, replica_id, [output])
+                            idle = False
+                        else:
+                            try:
+                                with nvtx_range("orchestrator:poll_llm_output"):
+                                    raw_outputs = await pool.poll_llm_raw_output(replica_id, timeout_s=0.001)
+                                if raw_outputs is None:
                                     continue
-                                req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
-                                req_state.streaming.new_prompt_len_snapshot = getattr(
-                                    eco,
-                                    "new_prompt_len_snapshot",
-                                    None,
-                                )
-                            now = _time.monotonic()
-                            record_stats = (
-                                self._stat_logger is not None and now - self._last_stats_ts >= self._stats_interval_s
-                            )
-                            iteration_stats = IterationStats() if record_stats else None
-                            raw_output = await pool.process_llm_raw_outputs(
-                                replica_id,
-                                raw_outputs,
-                                iteration_stats=iteration_stats,
-                            )
-                            if record_stats:
-                                self._last_stats_ts = now
-                                self._stat_logger.record(
-                                    raw_outputs.scheduler_stats,
-                                    iteration_stats,
-                                    engine_idx=self._stage_replica_to_engine_idx[(stage_id, replica_id)],
-                                )
-                        except asyncio.CancelledError:
-                            raise
-                        except EngineDeadError as e:
-                            logger.error(
-                                "[Orchestrator] Stage-%s is dead: %s",
-                                stage_id,
-                                e,
-                            )
-                            # TODO: Fault handling is intentionally fail-stop at
-                            # the orchestrator level today. If one replica in a
-                            # logical stage dies, we promote it to `_fatal_error`,
-                            # notify requests already admitted to that stage, and
-                            # re-raise so `run()` shuts down all stages. This is
-                            # conservative but means a single unhealthy replica in
-                            # a multi-replica deployment can take down otherwise
-                            # healthy replicas in other stages. Revisit this when
-                            # adding per-replica fault isolation / eviction.
-                            self._fatal_error = str(e)
-                            self._fatal_error_stage_id = stage_id
-                            for req_id, req_state in list(self.request_states.items()):
-                                if stage_id in req_state.stage_submit_ts:
-                                    await self.output_async_queue.put(
-                                        {
-                                            "type": "error",
-                                            "error": str(e),
-                                            "fatal": True,
-                                            "request_id": req_id,
-                                            "stage_id": stage_id,
-                                        }
-                                    )
-                                    self.request_states.pop(req_id, None)
-                            self._shutdown_event.set()
-                            raise
-                        except Exception:
-                            if self._shutdown_event.is_set():
-                                return
-                            logger.exception(
-                                "[Orchestrator] Stage-%s replica-%s processing failed",
-                                stage_id,
-                                replica_id,
-                            )
-                            raise
 
-                        await self._handle_processed_outputs(stage_id, replica_id, raw_output)
-                        idle = False
+                                await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
+                                for eco in raw_outputs.outputs:
+                                    req_state = self.request_states.get(getattr(eco, "request_id", None))
+                                    if req_state is None:
+                                        continue
+                                    req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
+                                    req_state.streaming.new_prompt_len_snapshot = getattr(
+                                        eco,
+                                        "new_prompt_len_snapshot",
+                                        None,
+                                    )
+                                now = _time.monotonic()
+                                record_stats = (
+                                    self._stat_logger is not None and now - self._last_stats_ts >= self._stats_interval_s
+                                )
+                                iteration_stats = IterationStats() if record_stats else None
+                                raw_output = await pool.process_llm_raw_outputs(
+                                    replica_id,
+                                    raw_outputs,
+                                    iteration_stats=iteration_stats,
+                                )
+                                if record_stats:
+                                    self._last_stats_ts = now
+                                    self._stat_logger.record(
+                                        raw_outputs.scheduler_stats,
+                                        iteration_stats,
+                                        engine_idx=self._stage_replica_to_engine_idx[(stage_id, replica_id)],
+                                    )
+                            except asyncio.CancelledError:
+                                raise
+                            except EngineDeadError as e:
+                                logger.error(
+                                    "[Orchestrator] Stage-%s is dead: %s",
+                                    stage_id,
+                                    e,
+                                )
+                                # TODO: Fault handling is intentionally fail-stop at
+                                # the orchestrator level today. If one replica in a
+                                # logical stage dies, we promote it to `_fatal_error`,
+                                # notify requests already admitted to that stage, and
+                                # re-raise so `run()` shuts down all stages. This is
+                                # conservative but means a single unhealthy replica in
+                                # a multi-replica deployment can take down otherwise
+                                # healthy replicas in other stages. Revisit this when
+                                # adding per-replica fault isolation / eviction.
+                                self._fatal_error = str(e)
+                                self._fatal_error_stage_id = stage_id
+                                for req_id, req_state in list(self.request_states.items()):
+                                    if stage_id in req_state.stage_submit_ts:
+                                        await self.output_async_queue.put(
+                                            {
+                                                "type": "error",
+                                                "error": str(e),
+                                                "fatal": True,
+                                                "request_id": req_id,
+                                                "stage_id": stage_id,
+                                            }
+                                        )
+                                        self.request_states.pop(req_id, None)
+                                self._shutdown_event.set()
+                                raise
+                            except Exception:
+                                if self._shutdown_event.is_set():
+                                    return
+                                logger.exception(
+                                    "[Orchestrator] Stage-%s replica-%s processing failed",
+                                    stage_id,
+                                    replica_id,
+                                )
+                                raise
+
+                            await self._handle_processed_outputs(stage_id, replica_id, raw_output)
+                            idle = False
 
             if idle:
                 await asyncio.sleep(0.001)

@@ -372,6 +372,7 @@ async def async_request_openai_chat_omni_completions(
     output.prompt_len = request_func_input.prompt_len
     max_retries = 3
     retry_delay = 0.1
+    # f=open(f"/home/response{random.randint(0,100)}.json","w")
     for attempt in range(max_retries + 1):
         # Reset per-attempt state so that retries do not mix partial
         # outputs or metrics from previous attempts.
@@ -402,6 +403,7 @@ async def async_request_openai_chat_omni_completions(
             async with session.post(url=api_url, json=payload, headers=headers) as response:
                 if response.status == 200:
                     handler = StreamedResponseHandler()
+                    cnt=0
                     async for chunk_bytes in response.content.iter_any():
                         # NOTE: Do NOT strip() here; TCP may fragment the SSE messages,
                         # so stripping here can cause problems depending on how it is split.
@@ -418,9 +420,10 @@ async def async_request_openai_chat_omni_completions(
                             # NOTE: SSE comments (often used as pings) start with
                             # a colon. These are not JSON data payload and should
                             # be skipped.
+                            cnt+=1
                             if message.startswith(":"):
                                 continue
-
+                            # print(f"[{cnt}] {message}",file=f)
                             chunk = message.removeprefix("data: ")
                             if chunk != "[DONE]":
                                 timestamp = time.perf_counter()
@@ -524,7 +527,7 @@ async def async_request_openai_chat_omni_completions(
             output.error = traceback.format_exc()
             logger.error(f"ERROR: send request failed, reason is: {output.error}")
             break
-
+    # f.close()
     if pbar:
         pbar.update(1)
     return output

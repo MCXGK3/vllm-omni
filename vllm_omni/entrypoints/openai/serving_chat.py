@@ -101,6 +101,7 @@ from vllm_omni.entrypoints.openai.utils import (
 )
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
+import nvtx
 
 logger = init_logger(__name__)
 
@@ -900,209 +901,399 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         last_metrics: dict[str, Any] | None = None
         try:
             async for omni_res in result_generator:
-                final_output_type = omni_res.final_output_type
-                res = omni_res.request_output
-                if final_output_type not in first_iteration_dict:
-                    logger.warning(f"final output type: {final_output_type} is not needed by the request")
-                    continue
+                with nvtx.annotate("process_generate_omni_res"):
+                    final_output_type = omni_res.final_output_type
+                    res = omni_res.request_output
+                    if final_output_type not in first_iteration_dict:
+                        logger.warning(f"final output type: {final_output_type} is not needed by the request")
+                        continue
 
-                if omni_res.metrics:
-                    last_metrics = omni_res.metrics
+                    if omni_res.metrics:
+                        last_metrics = omni_res.metrics
 
-                if res.prompt_token_ids is not None:
-                    num_prompt_tokens = len(res.prompt_token_ids)
-                    if res.encoder_prompt_token_ids is not None:
-                        num_prompt_tokens += len(res.encoder_prompt_token_ids)
+                    if res.prompt_token_ids is not None:
+                        num_prompt_tokens = len(res.prompt_token_ids)
+                        if res.encoder_prompt_token_ids is not None:
+                            num_prompt_tokens += len(res.encoder_prompt_token_ids)
 
-                # Initialize role before conditional blocks to avoid UnboundLocalError
-                # when handling audio/image responses
-                role = self.get_chat_request_role(request)
+                    # Initialize role before conditional blocks to avoid UnboundLocalError
+                    # when handling audio/image responses
+                    role = self.get_chat_request_role(request)
 
-                # We need to do it here, because if there are exceptions in
-                # the result_generator, it needs to be sent as the FIRST
-                # response (by the try...catch).
-                if first_iteration_dict[final_output_type] and final_output_type == "text":
-                    num_cached_tokens = res.num_cached_tokens
-                    # Send first response for each choice with role
-                    # NOTE: num_choices defaults to 1 so this usually executes once per request
-                    for i in range(num_choices):
-                        choice_data = ChatCompletionResponseStreamChoice(
-                            index=i,
-                            delta=DeltaMessage(
-                                role=role,
-                                content="",
-                            ),
-                            logprobs=None,
-                            finish_reason=None,
-                        )
-
-                        # return prompt_token_ids at the first chunk ever
-                        chunk = OmniChatCompletionStreamResponse(
-                            id=request_id,
-                            object=chunk_object_type,
-                            created=created_time,
-                            choices=[choice_data],
-                            model=model_name,
-                            prompt_token_ids=(res.prompt_token_ids if request.return_token_ids else None),
-                            modality=final_output_type,
-                        )
-
-                        # if continuous usage stats are requested, add it
-                        if include_continuous_usage:
-                            chunk.usage = UsageInfo(
-                                prompt_tokens=num_prompt_tokens,
-                                completion_tokens=0,
-                                total_tokens=num_prompt_tokens,
+                    # We need to do it here, because if there are exceptions in
+                    # the result_generator, it needs to be sent as the FIRST
+                    # response (by the try...catch).
+                    if first_iteration_dict[final_output_type] and final_output_type == "text":
+                        num_cached_tokens = res.num_cached_tokens
+                        # Send first response for each choice with role
+                        # NOTE: num_choices defaults to 1 so this usually executes once per request
+                        for i in range(num_choices):
+                            choice_data = ChatCompletionResponseStreamChoice(
+                                index=i,
+                                delta=DeltaMessage(
+                                    role=role,
+                                    content="",
+                                ),
+                                logprobs=None,
+                                finish_reason=None,
                             )
 
-                        data = chunk.model_dump_json(exclude_unset=True)
-                        yield f"data: {data}\n\n"
+                            # return prompt_token_ids at the first chunk ever
+                            chunk = OmniChatCompletionStreamResponse(
+                                id=request_id,
+                                object=chunk_object_type,
+                                created=created_time,
+                                choices=[choice_data],
+                                model=model_name,
+                                prompt_token_ids=(res.prompt_token_ids if request.return_token_ids else None),
+                                modality=final_output_type,
+                            )
 
-                    # Send response to echo the input portion of the
-                    # last message
-                    if request.echo:
-                        last_msg_content: str | list[dict[str, str]] = ""
-                        if conversation and "content" in conversation[-1] and conversation[-1].get("role") == role:
-                            last_msg_content = conversation[-1]["content"] or ""
+                            # if continuous usage stats are requested, add it
+                            if include_continuous_usage:
+                                chunk.usage = UsageInfo(
+                                    prompt_tokens=num_prompt_tokens,
+                                    completion_tokens=0,
+                                    total_tokens=num_prompt_tokens,
+                                )
 
-                        if last_msg_content:
-                            for i in range(num_choices):
-                                choice_data = ChatCompletionResponseStreamChoice(
-                                    index=i,
-                                    delta=DeltaMessage(content=last_msg_content),
-                                    logprobs=None,
-                                    finish_reason=None,
-                                )
-                                chunk = OmniChatCompletionStreamResponse(
-                                    id=request_id,
-                                    object=chunk_object_type,
-                                    created=created_time,
-                                    choices=[choice_data],
-                                    model=model_name,
-                                    modality=final_output_type,
-                                )
-                                if include_continuous_usage:
-                                    chunk.usage = UsageInfo(
-                                        prompt_tokens=num_prompt_tokens,
-                                        completion_tokens=0,
-                                        total_tokens=num_prompt_tokens,
+                            data = chunk.model_dump_json(exclude_unset=True)
+                            yield f"data: {data}\n\n"
+
+                        # Send response to echo the input portion of the
+                        # last message
+                        if request.echo:
+                            last_msg_content: str | list[dict[str, str]] = ""
+                            if conversation and "content" in conversation[-1] and conversation[-1].get("role") == role:
+                                last_msg_content = conversation[-1]["content"] or ""
+
+                            if last_msg_content:
+                                for i in range(num_choices):
+                                    choice_data = ChatCompletionResponseStreamChoice(
+                                        index=i,
+                                        delta=DeltaMessage(content=last_msg_content),
+                                        logprobs=None,
+                                        finish_reason=None,
                                     )
+                                    chunk = OmniChatCompletionStreamResponse(
+                                        id=request_id,
+                                        object=chunk_object_type,
+                                        created=created_time,
+                                        choices=[choice_data],
+                                        model=model_name,
+                                        modality=final_output_type,
+                                    )
+                                    if include_continuous_usage:
+                                        chunk.usage = UsageInfo(
+                                            prompt_tokens=num_prompt_tokens,
+                                            completion_tokens=0,
+                                            total_tokens=num_prompt_tokens,
+                                        )
 
-                                data = chunk.model_dump_json(exclude_unset=True)
-                                yield f"data: {data}\n\n"
-                    first_iteration_dict[final_output_type] = False
+                                    data = chunk.model_dump_json(exclude_unset=True)
+                                    yield f"data: {data}\n\n"
+                        first_iteration_dict[final_output_type] = False
 
-                if final_output_type == "text":
-                    for output in res.outputs:
-                        i = output.index
-                        tool_parser = tool_parsers[i]
+                    if final_output_type == "text":
+                        for output in res.outputs:
+                            i = output.index
+                            tool_parser = tool_parsers[i]
 
-                        if finish_reason_sent[i]:
-                            continue
+                            if finish_reason_sent[i]:
+                                continue
 
-                        if request.logprobs and request.top_logprobs is not None:
-                            assert output.logprobs is not None, "Did not output logprobs"
-                            logprobs = self._create_chat_logprobs(
-                                token_ids=output.token_ids,
-                                top_logprobs=output.logprobs,
-                                tokenizer=tokenizer,
-                                num_output_top_logprobs=request.top_logprobs,
-                                return_as_token_id=request.return_tokens_as_token_ids,
-                            )
-                        else:
-                            logprobs = None
-
-                        if self.use_harmony:
-                            harmony_parser = harmony_parsers[i]
-                            prev_recipient = harmony_parser.current_recipient
-                            delta_text = ""
-                            for token_id in output.token_ids:
-                                harmony_parser.process(token_id)
-                                delta_text += harmony_parser.last_content_delta or ""
-                            cur_channel = harmony_parser.current_channel
-                            cur_recipient = harmony_parser.current_recipient
-                        else:
-                            delta_text = output.text or ""
-
-                        if not delta_text and not output.token_ids and not previous_num_tokens[i]:
-                            # Chunked prefill case, don't return empty chunks
-                            continue
-
-                        delta_message: DeltaMessage | None
-
-                        # just update previous_texts and previous_token_ids
-                        if tool_choice_auto or reasoning_parser:
-                            assert previous_texts is not None
-                            assert all_previous_token_ids is not None
-                            previous_text = previous_texts[i]
-                            previous_token_ids = all_previous_token_ids[i]
-                            current_text = previous_text + delta_text
-                            # avoid the None + list error.
-                            if previous_token_ids:
-                                current_token_ids = previous_token_ids + as_list(output.token_ids)
+                            if request.logprobs and request.top_logprobs is not None:
+                                assert output.logprobs is not None, "Did not output logprobs"
+                                logprobs = self._create_chat_logprobs(
+                                    token_ids=output.token_ids,
+                                    top_logprobs=output.logprobs,
+                                    tokenizer=tokenizer,
+                                    num_output_top_logprobs=request.top_logprobs,
+                                    return_as_token_id=request.return_tokens_as_token_ids,
+                                )
                             else:
-                                current_token_ids = as_list(output.token_ids)
+                                logprobs = None
 
-                        if self.use_harmony:
-                            if cur_channel == "final":
-                                delta_message = DeltaMessage(content=delta_text)
-                            elif cur_channel == "analysis":
-                                if request.include_reasoning:
-                                    delta_message = DeltaMessage(reasoning=delta_text)
+                            if self.use_harmony:
+                                harmony_parser = harmony_parsers[i]
+                                prev_recipient = harmony_parser.current_recipient
+                                delta_text = ""
+                                for token_id in output.token_ids:
+                                    harmony_parser.process(token_id)
+                                    delta_text += harmony_parser.last_content_delta or ""
+                                cur_channel = harmony_parser.current_channel
+                                cur_recipient = harmony_parser.current_recipient
+                            else:
+                                delta_text = output.text or ""
+
+                            if not delta_text and not output.token_ids and not previous_num_tokens[i]:
+                                # Chunked prefill case, don't return empty chunks
+                                continue
+
+                            delta_message: DeltaMessage | None
+
+                            # just update previous_texts and previous_token_ids
+                            if tool_choice_auto or reasoning_parser:
+                                assert previous_texts is not None
+                                assert all_previous_token_ids is not None
+                                previous_text = previous_texts[i]
+                                previous_token_ids = all_previous_token_ids[i]
+                                current_text = previous_text + delta_text
+                                # avoid the None + list error.
+                                if previous_token_ids:
+                                    current_token_ids = previous_token_ids + as_list(output.token_ids)
+                                else:
+                                    current_token_ids = as_list(output.token_ids)
+
+                            if self.use_harmony:
+                                if cur_channel == "final":
+                                    delta_message = DeltaMessage(content=delta_text)
+                                elif cur_channel == "analysis":
+                                    if request.include_reasoning:
+                                        delta_message = DeltaMessage(reasoning=delta_text)
+                                    else:
+                                        delta_message = None
+                                elif (
+                                    cur_channel == "commentary" and cur_recipient and cur_recipient.startswith("functions.")
+                                ):
+                                    # Count completed tool calls to determine index
+                                    base_index = 0
+                                    for msg in harmony_parser.messages:
+                                        if (
+                                            msg.channel == "commentary"
+                                            and msg.recipient
+                                            and msg.recipient.startswith("functions.")
+                                        ):
+                                            base_index += 1
+
+                                    if prev_recipient != cur_recipient:
+                                        tool_name = cur_recipient.split("functions.", 1)[1]
+                                        delta_message = DeltaMessage(
+                                            tool_calls=[
+                                                DeltaToolCall(
+                                                    id=make_tool_call_id(),
+                                                    type="function",
+                                                    function=DeltaFunctionCall(
+                                                        name=tool_name,
+                                                        arguments="",
+                                                    ),
+                                                    index=base_index,
+                                                )
+                                            ]
+                                        )
+                                    elif delta_text:
+                                        delta_message = DeltaMessage(
+                                            tool_calls=[
+                                                DeltaToolCall(
+                                                    index=base_index,
+                                                    function=DeltaFunctionCall(arguments=delta_text),
+                                                )
+                                            ]
+                                        )
+                                    else:
+                                        delta_message = None
+
+                                    if delta_message is not None:
+                                        harmony_tools_streamed[i] = True
                                 else:
                                     delta_message = None
-                            elif (
-                                cur_channel == "commentary" and cur_recipient and cur_recipient.startswith("functions.")
-                            ):
-                                # Count completed tool calls to determine index
-                                base_index = 0
-                                for msg in harmony_parser.messages:
-                                    if (
-                                        msg.channel == "commentary"
-                                        and msg.recipient
-                                        and msg.recipient.startswith("functions.")
+                            # handle streaming deltas for tools with named tool_choice
+                            elif tool_choice_function_name:
+                                if (
+                                    reasoning_parser
+                                    and not reasoning_end_arr[i]
+                                    and not reasoning_parser.is_reasoning_end(previous_token_ids)
+                                ):
+                                    assert reasoning_parser is not None
+                                    delta_message = reasoning_parser.extract_reasoning_streaming(
+                                        previous_text,
+                                        current_text,
+                                        delta_text,
+                                        previous_token_ids,
+                                        current_token_ids,
+                                        output.token_ids,
+                                    )
+                                    # When encountering think end id in delta_token_ids
+                                    # or think end id in prompt_token_ids
+                                    # i.e {"enable_thinking": False},
+                                    # set reasoning status to end.
+                                    # Only keep 'content', remove 'reasoning'.
+                                    if reasoning_parser.is_reasoning_end(as_list(output.token_ids)) or (
+                                        res.prompt_token_ids and reasoning_parser.is_reasoning_end(res.prompt_token_ids)
                                     ):
-                                        base_index += 1
-
-                                if prev_recipient != cur_recipient:
-                                    tool_name = cur_recipient.split("functions.", 1)[1]
-                                    delta_message = DeltaMessage(
-                                        tool_calls=[
-                                            DeltaToolCall(
-                                                id=make_tool_call_id(),
-                                                type="function",
-                                                function=DeltaFunctionCall(
-                                                    name=tool_name,
-                                                    arguments="",
-                                                ),
-                                                index=base_index,
-                                            )
-                                        ]
-                                    )
-                                elif delta_text:
-                                    delta_message = DeltaMessage(
-                                        tool_calls=[
-                                            DeltaToolCall(
-                                                index=base_index,
-                                                function=DeltaFunctionCall(arguments=delta_text),
-                                            )
-                                        ]
-                                    )
+                                        reasoning_end_arr[i] = True
+                                        if delta_message and delta_message.content:
+                                            # This need to be added to next `delta_text`
+                                            current_text = delta_message.content
+                                            delta_message.content = None
+                                        else:
+                                            current_text = ""
                                 else:
-                                    delta_message = None
+                                    # Just to add remaining `content`
+                                    if reasoning_parser:
+                                        delta_text = previous_text + delta_text
+                                        current_text = ""
 
-                                if delta_message is not None:
-                                    harmony_tools_streamed[i] = True
-                            else:
-                                delta_message = None
-                        # handle streaming deltas for tools with named tool_choice
-                        elif tool_choice_function_name:
-                            if (
-                                reasoning_parser
-                                and not reasoning_end_arr[i]
-                                and not reasoning_parser.is_reasoning_end(previous_token_ids)
-                            ):
+                                    if function_name_returned[i]:
+                                        delta_tool_call = DeltaToolCall(
+                                            function=DeltaFunctionCall(arguments=delta_text),
+                                            index=i,
+                                        )
+                                    else:
+                                        delta_tool_call = DeltaToolCall(
+                                            id=make_tool_call_id(),
+                                            type="function",
+                                            function=DeltaFunctionCall(
+                                                name=tool_choice_function_name,
+                                                arguments=delta_text,
+                                            ),
+                                            index=i,
+                                        )
+                                        function_name_returned[i] = True
+
+                                    delta_message = DeltaMessage(
+                                        tool_calls=[
+                                            delta_tool_call,
+                                        ]
+                                    )
+                                    tools_streamed[i] = True
+
+                            elif request.tool_choice == "required":
+                                assert previous_texts is not None
+                                previous_text = previous_texts[i]
+                                current_text = previous_text + delta_text
+                                fn_name_returned = function_name_returned[i]
+                                output_token_ids = as_list(output.token_ids)
+
+                                if (
+                                    reasoning_parser is not None
+                                    and not reasoning_end_arr[i]
+                                    and res.prompt_token_ids
+                                    and reasoning_parser.is_reasoning_end(res.prompt_token_ids)
+                                ):
+                                    reasoning_end_arr[i] = True
+
+                                if reasoning_parser and not reasoning_end_arr[i]:
+                                    delta_message = reasoning_parser.extract_reasoning_streaming(
+                                        previous_text,
+                                        current_text,
+                                        delta_text,
+                                        previous_token_ids,
+                                        current_token_ids,
+                                        output_token_ids,
+                                    )
+                                    if reasoning_parser.is_reasoning_end(output_token_ids):
+                                        reasoning_end_arr[i] = True
+                                        if delta_message and delta_message.content:
+                                            current_text = delta_message.content
+                                            delta_message.content = None
+                                        else:
+                                            # reasoning ended
+                                            current_text = ""
+
+                                else:
+                                    # either finished reasoning or no reasoning at all
+                                    content = current_text
+
+                                    delta_message, function_name_returned[i] = self.extract_tool_call_required_streaming(
+                                        previous_text=previous_text,
+                                        current_text=content,
+                                        delta_text=delta_text,
+                                        function_name_returned=fn_name_returned,
+                                        tool_call_idx=history_tool_call_cnt,
+                                    )
+                                    if (
+                                        delta_message
+                                        and delta_message.tool_calls
+                                        and delta_message.tool_calls[0].id is not None
+                                    ):
+                                        history_tool_call_cnt += 1
+                                        tools_streamed[i] = True
+
+                            # handle streaming deltas for tools with "auto" tool choice
+                            # and reasoning parser
+                            elif tool_choice_auto and reasoning_parser:
+                                assert tool_parser is not None
                                 assert reasoning_parser is not None
+                                assert added_content_delta_arr is not None
+                                assert reasoning_end_arr is not None
+                                output_token_ids = as_list(output.token_ids)
+                                if not reasoning_end_arr[i]:
+                                    delta_message = reasoning_parser.extract_reasoning_streaming(
+                                        previous_text,
+                                        current_text,
+                                        delta_text,
+                                        previous_token_ids,
+                                        current_token_ids,
+                                        output_token_ids,
+                                    )
+                                    # When encountering think end id in prompt_token_ids
+                                    # i.e {"enable_thinking": False},
+                                    # set reasoning status to end.
+                                    # Remove the text and token ids related
+                                    # to 'reasoning'.
+                                    if res.prompt_token_ids and reasoning_parser.is_reasoning_end(res.prompt_token_ids):
+                                        reasoning_end_arr[i] = True
+                                        current_token_ids = output_token_ids
+                                        if delta_message and delta_message.content:
+                                            current_text = delta_message.content
+                                            delta_message.content = None
+                                        else:
+                                            current_text = ""
+                                    # When encountering think end id in delta_token_ids,
+                                    # set reasoning status to end.
+                                    # Remove the text and token ids related
+                                    # to 'reasoning'.
+                                    if reasoning_parser.is_reasoning_end(output_token_ids):
+                                        reasoning_end_arr[i] = True
+                                        current_token_ids = reasoning_parser.extract_content_ids(output_token_ids)
+                                        if delta_message and delta_message.content:
+                                            current_text = delta_message.content
+                                            delta_message.content = None
+                                        else:
+                                            current_text = ""
+
+                                # handle tool calls only after reasoning is done,
+                                else:
+                                    delta_token_ids = output_token_ids
+                                    # First time to tool call,
+                                    # add the remaining text and token ids
+                                    # to delta from previous
+                                    if not added_content_delta_arr[i]:
+                                        added_content_delta_arr[i] = True
+                                        previous_text = ""
+                                        previous_token_ids = []
+                                        delta_text = current_text
+                                        delta_token_ids = current_token_ids
+
+                                    delta_message = tool_parser.extract_tool_calls_streaming(
+                                        previous_text=previous_text,
+                                        current_text=current_text,
+                                        delta_text=delta_text,
+                                        previous_token_ids=previous_token_ids,
+                                        current_token_ids=current_token_ids,
+                                        delta_token_ids=delta_token_ids,
+                                        request=request,
+                                    )
+                                    if delta_message and delta_message.tool_calls:
+                                        tools_streamed[i] = True
+                            # when only tool calls
+                            elif tool_choice_auto:
+                                assert tool_parser is not None
+                                delta_message = tool_parser.extract_tool_calls_streaming(
+                                    previous_text=previous_text,
+                                    current_text=current_text,
+                                    delta_text=delta_text,
+                                    previous_token_ids=previous_token_ids,
+                                    current_token_ids=current_token_ids,
+                                    delta_token_ids=output.token_ids,
+                                    request=request,
+                                )
+                                if delta_message and delta_message.tool_calls:
+                                    tools_streamed[i] = True
+
+                            # when only reasoning
+                            elif reasoning_parser:
                                 delta_message = reasoning_parser.extract_reasoning_streaming(
                                     previous_text,
                                     current_text,
@@ -1111,403 +1302,215 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                                     current_token_ids,
                                     output.token_ids,
                                 )
-                                # When encountering think end id in delta_token_ids
-                                # or think end id in prompt_token_ids
-                                # i.e {"enable_thinking": False},
-                                # set reasoning status to end.
-                                # Only keep 'content', remove 'reasoning'.
-                                if reasoning_parser.is_reasoning_end(as_list(output.token_ids)) or (
-                                    res.prompt_token_ids and reasoning_parser.is_reasoning_end(res.prompt_token_ids)
-                                ):
-                                    reasoning_end_arr[i] = True
-                                    if delta_message and delta_message.content:
-                                        # This need to be added to next `delta_text`
-                                        current_text = delta_message.content
-                                        delta_message.content = None
-                                    else:
-                                        current_text = ""
+                            # handle streaming just a content delta
                             else:
-                                # Just to add remaining `content`
-                                if reasoning_parser:
-                                    delta_text = previous_text + delta_text
-                                    current_text = ""
+                                delta_message = DeltaMessage(content=delta_text)
 
-                                if function_name_returned[i]:
-                                    delta_tool_call = DeltaToolCall(
-                                        function=DeltaFunctionCall(arguments=delta_text),
-                                        index=i,
+                            # update the previous values for the next iteration
+                            if (tool_choice_auto or reasoning_parser) and not self.use_harmony:
+                                assert previous_texts is not None
+                                assert all_previous_token_ids is not None
+                                previous_texts[i] = current_text
+                                all_previous_token_ids[i] = current_token_ids
+                            else:
+                                # Update for comprehensive logging even in simple case
+                                assert previous_texts is not None
+                                previous_texts[i] += delta_text
+
+                            # set the previous values for the next iteration
+                            previous_num_tokens[i] += len(output.token_ids)
+
+                            # if the message delta is None (e.g. because it was a
+                            # "control token" for tool calls or the parser otherwise
+                            # wasn't ready to send a token, then
+                            #   get the next token without streaming a chunk
+                            if delta_message is None:
+                                if output.finish_reason is None and not request.return_token_ids:
+                                    continue
+                                delta_message = DeltaMessage()
+
+                            # Log streaming delta if output logging is enabled
+                            if self.enable_log_outputs and self.request_logger:
+                                delta_content = ""
+                                if delta_message.content:
+                                    delta_content = delta_message.content
+                                elif delta_message.tool_calls:
+                                    delta_content = "".join(
+                                        tc.function.arguments
+                                        for tc in delta_message.tool_calls
+                                        if tc.function and tc.function.arguments
                                     )
+
+                                if delta_content:
+                                    self.request_logger.log_outputs(
+                                        request_id=request_id,
+                                        outputs=delta_content,
+                                        output_token_ids=as_list(output.token_ids),
+                                        finish_reason=output.finish_reason,
+                                        is_streaming=True,
+                                        delta=True,
+                                    )
+
+                            if output.finish_reason is None:
+                                # Send token-by-token response for each request.n
+                                choice_data = ChatCompletionResponseStreamChoice(
+                                    index=i,
+                                    delta=delta_message,
+                                    logprobs=logprobs,
+                                    finish_reason=None,
+                                    token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
+                                )
+
+                            # if the model is finished generating
+                            else:
+                                # check to make sure we haven't "forgotten" to stream
+                                #   any tokens that were generated but previously
+                                #   matched by partial json parsing
+                                # only happens if we are NOT using structured outputs
+                                auto_tools_called = False
+                                if tool_parser:
+                                    auto_tools_called = len(tool_parser.prev_tool_call_arr) > 0
+                                    index = len(tool_parser.prev_tool_call_arr) - 1 if auto_tools_called else 0
                                 else:
-                                    delta_tool_call = DeltaToolCall(
-                                        id=make_tool_call_id(),
-                                        type="function",
-                                        function=DeltaFunctionCall(
-                                            name=tool_choice_function_name,
-                                            arguments=delta_text,
-                                        ),
-                                        index=i,
-                                    )
-                                    function_name_returned[i] = True
+                                    index = 0
 
-                                delta_message = DeltaMessage(
-                                    tool_calls=[
-                                        delta_tool_call,
-                                    ]
-                                )
-                                tools_streamed[i] = True
-
-                        elif request.tool_choice == "required":
-                            assert previous_texts is not None
-                            previous_text = previous_texts[i]
-                            current_text = previous_text + delta_text
-                            fn_name_returned = function_name_returned[i]
-                            output_token_ids = as_list(output.token_ids)
-
-                            if (
-                                reasoning_parser is not None
-                                and not reasoning_end_arr[i]
-                                and res.prompt_token_ids
-                                and reasoning_parser.is_reasoning_end(res.prompt_token_ids)
-                            ):
-                                reasoning_end_arr[i] = True
-
-                            if reasoning_parser and not reasoning_end_arr[i]:
-                                delta_message = reasoning_parser.extract_reasoning_streaming(
-                                    previous_text,
-                                    current_text,
-                                    delta_text,
-                                    previous_token_ids,
-                                    current_token_ids,
-                                    output_token_ids,
-                                )
-                                if reasoning_parser.is_reasoning_end(output_token_ids):
-                                    reasoning_end_arr[i] = True
-                                    if delta_message and delta_message.content:
-                                        current_text = delta_message.content
-                                        delta_message.content = None
-                                    else:
-                                        # reasoning ended
-                                        current_text = ""
-
-                            else:
-                                # either finished reasoning or no reasoning at all
-                                content = current_text
-
-                                delta_message, function_name_returned[i] = self.extract_tool_call_required_streaming(
-                                    previous_text=previous_text,
-                                    current_text=content,
-                                    delta_text=delta_text,
-                                    function_name_returned=fn_name_returned,
-                                    tool_call_idx=history_tool_call_cnt,
-                                )
-                                if (
-                                    delta_message
-                                    and delta_message.tool_calls
-                                    and delta_message.tool_calls[0].id is not None
-                                ):
-                                    history_tool_call_cnt += 1
-                                    tools_streamed[i] = True
-
-                        # handle streaming deltas for tools with "auto" tool choice
-                        # and reasoning parser
-                        elif tool_choice_auto and reasoning_parser:
-                            assert tool_parser is not None
-                            assert reasoning_parser is not None
-                            assert added_content_delta_arr is not None
-                            assert reasoning_end_arr is not None
-                            output_token_ids = as_list(output.token_ids)
-                            if not reasoning_end_arr[i]:
-                                delta_message = reasoning_parser.extract_reasoning_streaming(
-                                    previous_text,
-                                    current_text,
-                                    delta_text,
-                                    previous_token_ids,
-                                    current_token_ids,
-                                    output_token_ids,
-                                )
-                                # When encountering think end id in prompt_token_ids
-                                # i.e {"enable_thinking": False},
-                                # set reasoning status to end.
-                                # Remove the text and token ids related
-                                # to 'reasoning'.
-                                if res.prompt_token_ids and reasoning_parser.is_reasoning_end(res.prompt_token_ids):
-                                    reasoning_end_arr[i] = True
-                                    current_token_ids = output_token_ids
-                                    if delta_message and delta_message.content:
-                                        current_text = delta_message.content
-                                        delta_message.content = None
-                                    else:
-                                        current_text = ""
-                                # When encountering think end id in delta_token_ids,
-                                # set reasoning status to end.
-                                # Remove the text and token ids related
-                                # to 'reasoning'.
-                                if reasoning_parser.is_reasoning_end(output_token_ids):
-                                    reasoning_end_arr[i] = True
-                                    current_token_ids = reasoning_parser.extract_content_ids(output_token_ids)
-                                    if delta_message and delta_message.content:
-                                        current_text = delta_message.content
-                                        delta_message.content = None
-                                    else:
-                                        current_text = ""
-
-                            # handle tool calls only after reasoning is done,
-                            else:
-                                delta_token_ids = output_token_ids
-                                # First time to tool call,
-                                # add the remaining text and token ids
-                                # to delta from previous
-                                if not added_content_delta_arr[i]:
-                                    added_content_delta_arr[i] = True
-                                    previous_text = ""
-                                    previous_token_ids = []
-                                    delta_text = current_text
-                                    delta_token_ids = current_token_ids
-
-                                delta_message = tool_parser.extract_tool_calls_streaming(
-                                    previous_text=previous_text,
-                                    current_text=current_text,
-                                    delta_text=delta_text,
-                                    previous_token_ids=previous_token_ids,
-                                    current_token_ids=current_token_ids,
-                                    delta_token_ids=delta_token_ids,
-                                    request=request,
-                                )
-                                if delta_message and delta_message.tool_calls:
-                                    tools_streamed[i] = True
-                        # when only tool calls
-                        elif tool_choice_auto:
-                            assert tool_parser is not None
-                            delta_message = tool_parser.extract_tool_calls_streaming(
-                                previous_text=previous_text,
-                                current_text=current_text,
-                                delta_text=delta_text,
-                                previous_token_ids=previous_token_ids,
-                                current_token_ids=current_token_ids,
-                                delta_token_ids=output.token_ids,
-                                request=request,
-                            )
-                            if delta_message and delta_message.tool_calls:
-                                tools_streamed[i] = True
-
-                        # when only reasoning
-                        elif reasoning_parser:
-                            delta_message = reasoning_parser.extract_reasoning_streaming(
-                                previous_text,
-                                current_text,
-                                delta_text,
-                                previous_token_ids,
-                                current_token_ids,
-                                output.token_ids,
-                            )
-                        # handle streaming just a content delta
-                        else:
-                            delta_message = DeltaMessage(content=delta_text)
-
-                        # update the previous values for the next iteration
-                        if (tool_choice_auto or reasoning_parser) and not self.use_harmony:
-                            assert previous_texts is not None
-                            assert all_previous_token_ids is not None
-                            previous_texts[i] = current_text
-                            all_previous_token_ids[i] = current_token_ids
-                        else:
-                            # Update for comprehensive logging even in simple case
-                            assert previous_texts is not None
-                            previous_texts[i] += delta_text
-
-                        # set the previous values for the next iteration
-                        previous_num_tokens[i] += len(output.token_ids)
-
-                        # if the message delta is None (e.g. because it was a
-                        # "control token" for tool calls or the parser otherwise
-                        # wasn't ready to send a token, then
-                        #   get the next token without streaming a chunk
-                        if delta_message is None:
-                            if output.finish_reason is None and not request.return_token_ids:
-                                continue
-                            delta_message = DeltaMessage()
-
-                        # Log streaming delta if output logging is enabled
-                        if self.enable_log_outputs and self.request_logger:
-                            delta_content = ""
-                            if delta_message.content:
-                                delta_content = delta_message.content
-                            elif delta_message.tool_calls:
-                                delta_content = "".join(
-                                    tc.function.arguments
-                                    for tc in delta_message.tool_calls
-                                    if tc.function and tc.function.arguments
-                                )
-
-                            if delta_content:
-                                self.request_logger.log_outputs(
-                                    request_id=request_id,
-                                    outputs=delta_content,
-                                    output_token_ids=as_list(output.token_ids),
-                                    finish_reason=output.finish_reason,
-                                    is_streaming=True,
-                                    delta=True,
-                                )
-
-                        if output.finish_reason is None:
-                            # Send token-by-token response for each request.n
-                            choice_data = ChatCompletionResponseStreamChoice(
-                                index=i,
-                                delta=delta_message,
-                                logprobs=logprobs,
-                                finish_reason=None,
-                                token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
-                            )
-
-                        # if the model is finished generating
-                        else:
-                            # check to make sure we haven't "forgotten" to stream
-                            #   any tokens that were generated but previously
-                            #   matched by partial json parsing
-                            # only happens if we are NOT using structured outputs
-                            auto_tools_called = False
-                            if tool_parser:
-                                auto_tools_called = len(tool_parser.prev_tool_call_arr) > 0
-                                index = len(tool_parser.prev_tool_call_arr) - 1 if auto_tools_called else 0
-                            else:
-                                index = 0
-
-                            if self._should_check_for_unstreamed_tool_arg_tokens(delta_message, output) and tool_parser:
-                                latest_delta_len = 0
-                                if (
-                                    isinstance(
-                                        delta_message.tool_calls[0].function,
-                                        DeltaFunctionCall,
-                                    )
-                                ) and isinstance(delta_message.tool_calls[0].function.arguments, str):
-                                    latest_delta_len = len(delta_message.tool_calls[0].function.arguments)
-
-                                # get the expected call based on partial JSON
-                                # parsing which "autocompletes" the JSON.
-                                # Tool parsers (e.g. Qwen3Coder) store
-                                # arguments as a JSON string in
-                                # prev_tool_call_arr. Calling json.dumps()
-                                # on an already-serialized string would
-                                # double-serialize it (e.g. '{"k":1}' becomes
-                                # '"{\\"k\\":1}"'), which then causes the
-                                # replace() below to fail and append the
-                                # entire double-serialized string as a
-                                # spurious final delta.
-                                args = tool_parser.prev_tool_call_arr[index].get("arguments", {})
-                                if isinstance(args, str):
-                                    expected_call = args
-                                else:
-                                    expected_call = json.dumps(args, ensure_ascii=False)
-
-                                # get what we've streamed so far for arguments
-                                # for the current tool
-                                actual_call = tool_parser.streamed_args_for_tool[index]
-                                if latest_delta_len > 0:
-                                    actual_call = actual_call[:-latest_delta_len]
-
-                                # check to see if there's anything left to stream
-                                remaining_call = expected_call.replace(actual_call, "", 1)
-                                # set that as a delta message
-                                delta_message = DeltaMessage(
-                                    tool_calls=[
-                                        DeltaToolCall(
-                                            index=index,
-                                            function=DeltaFunctionCall(arguments=remaining_call).model_dump(
-                                                exclude_none=True
-                                            ),
+                                if self._should_check_for_unstreamed_tool_arg_tokens(delta_message, output) and tool_parser:
+                                    latest_delta_len = 0
+                                    if (
+                                        isinstance(
+                                            delta_message.tool_calls[0].function,
+                                            DeltaFunctionCall,
                                         )
-                                    ]
+                                    ) and isinstance(delta_message.tool_calls[0].function.arguments, str):
+                                        latest_delta_len = len(delta_message.tool_calls[0].function.arguments)
+
+                                    # get the expected call based on partial JSON
+                                    # parsing which "autocompletes" the JSON.
+                                    # Tool parsers (e.g. Qwen3Coder) store
+                                    # arguments as a JSON string in
+                                    # prev_tool_call_arr. Calling json.dumps()
+                                    # on an already-serialized string would
+                                    # double-serialize it (e.g. '{"k":1}' becomes
+                                    # '"{\\"k\\":1}"'), which then causes the
+                                    # replace() below to fail and append the
+                                    # entire double-serialized string as a
+                                    # spurious final delta.
+                                    args = tool_parser.prev_tool_call_arr[index].get("arguments", {})
+                                    if isinstance(args, str):
+                                        expected_call = args
+                                    else:
+                                        expected_call = json.dumps(args, ensure_ascii=False)
+
+                                    # get what we've streamed so far for arguments
+                                    # for the current tool
+                                    actual_call = tool_parser.streamed_args_for_tool[index]
+                                    if latest_delta_len > 0:
+                                        actual_call = actual_call[:-latest_delta_len]
+
+                                    # check to see if there's anything left to stream
+                                    remaining_call = expected_call.replace(actual_call, "", 1)
+                                    # set that as a delta message
+                                    delta_message = DeltaMessage(
+                                        tool_calls=[
+                                            DeltaToolCall(
+                                                index=index,
+                                                function=DeltaFunctionCall(arguments=remaining_call).model_dump(
+                                                    exclude_none=True
+                                                ),
+                                            )
+                                        ]
+                                    )
+
+                                # Send the finish response for each request.n only once
+                                # In OpenAI's API, when a tool is called, the
+                                # finish_reason is:
+                                # "tool_calls" for "auto" or "required" tool calls,
+                                # and "stop" for named tool calls.
+                                if (
+                                    auto_tools_called
+                                    or (tools_streamed[i] and not tool_choice_function_name)
+                                    or (self.use_harmony and harmony_tools_streamed[i])
+                                ):
+                                    finish_reason_ = "tool_calls"
+                                else:
+                                    finish_reason_ = output.finish_reason if output.finish_reason else "stop"
+                                choice_data = ChatCompletionResponseStreamChoice(
+                                    index=i,
+                                    delta=delta_message,
+                                    logprobs=logprobs,
+                                    finish_reason=finish_reason_,
+                                    stop_reason=output.stop_reason,
+                                    token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
                                 )
 
-                            # Send the finish response for each request.n only once
-                            # In OpenAI's API, when a tool is called, the
-                            # finish_reason is:
-                            # "tool_calls" for "auto" or "required" tool calls,
-                            # and "stop" for named tool calls.
-                            if (
-                                auto_tools_called
-                                or (tools_streamed[i] and not tool_choice_function_name)
-                                or (self.use_harmony and harmony_tools_streamed[i])
-                            ):
-                                finish_reason_ = "tool_calls"
-                            else:
-                                finish_reason_ = output.finish_reason if output.finish_reason else "stop"
-                            choice_data = ChatCompletionResponseStreamChoice(
-                                index=i,
-                                delta=delta_message,
-                                logprobs=logprobs,
-                                finish_reason=finish_reason_,
-                                stop_reason=output.stop_reason,
-                                token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
+                                finish_reason_sent[i] = True
+
+                            choice_data = maybe_filter_parallel_tool_calls(choice_data, request)
+                            chunk = OmniChatCompletionStreamResponse(
+                                id=request_id,
+                                object=chunk_object_type,
+                                created=created_time,
+                                choices=[choice_data],
+                                model=model_name,
+                                modality=final_output_type,
+                                metrics=omni_res.metrics,
                             )
 
-                            finish_reason_sent[i] = True
+                            # handle usage stats if requested & if continuous
+                            if include_continuous_usage:
+                                completion_tokens = previous_num_tokens[i]
+                                chunk.usage = UsageInfo(
+                                    prompt_tokens=num_prompt_tokens,
+                                    completion_tokens=completion_tokens,
+                                    total_tokens=num_prompt_tokens + completion_tokens,
+                                )
 
-                        choice_data = maybe_filter_parallel_tool_calls(choice_data, request)
+                            data = chunk.model_dump_json(exclude_unset=True)
+                            yield f"data: {data}\n\n"
+
+                    elif final_output_type == "audio":
+                        # Phase 3.3: observe audio_ttfp_seconds on first audio packet
+                        # for this request_id (once-per-request guard via first_audio_ts).
+                        req_state = self.engine_client.request_states.get(request_id)
+                        if req_state is not None and req_state.first_audio_ts is None:
+                            now_ts = time.time()
+                            req_state.first_audio_ts = now_ts
+                            stage_pools = getattr(self.engine_client.engine, "stage_pools", None)
+                            replica_id = (
+                                stage_pools[omni_res.stage_id].get_bound_replica_id(request_id)
+                                if stage_pools is not None and 0 <= omni_res.stage_id < len(stage_pools)
+                                else None
+                            )
+                            nvtx.mark(f"audio_first_packet for {request_id}")
+                            observe_audio_first_packet(
+                                self.engine_client.mod_metrics,
+                                stage_id=omni_res.stage_id,
+                                replica_id=replica_id,
+                                arrival_ts=req_state.request_arrival_ts,
+                                now_ts=now_ts,
+                            )
+                        nvtx.mark(f"audio_packet for {request_id}")
+                        role = self.get_chat_request_role(request)
+                        choices_data = self._create_audio_choice(omni_res, role, request, stream=True)
                         chunk = OmniChatCompletionStreamResponse(
                             id=request_id,
                             object=chunk_object_type,
                             created=created_time,
-                            choices=[choice_data],
+                            choices=choices_data,
                             model=model_name,
                             modality=final_output_type,
-                            metrics=omni_res.metrics,
                         )
-
-                        # handle usage stats if requested & if continuous
-                        if include_continuous_usage:
-                            completion_tokens = previous_num_tokens[i]
-                            chunk.usage = UsageInfo(
-                                prompt_tokens=num_prompt_tokens,
-                                completion_tokens=completion_tokens,
-                                total_tokens=num_prompt_tokens + completion_tokens,
-                            )
-
+                        chunk.usage = UsageInfo(
+                            prompt_tokens=num_prompt_tokens,
+                            completion_tokens=0,
+                            total_tokens=num_prompt_tokens,
+                        )
                         data = chunk.model_dump_json(exclude_unset=True)
                         yield f"data: {data}\n\n"
 
-                elif final_output_type == "audio":
-                    # Phase 3.3: observe audio_ttfp_seconds on first audio packet
-                    # for this request_id (once-per-request guard via first_audio_ts).
-                    req_state = self.engine_client.request_states.get(request_id)
-                    if req_state is not None and req_state.first_audio_ts is None:
-                        now_ts = time.time()
-                        req_state.first_audio_ts = now_ts
-                        stage_pools = getattr(self.engine_client.engine, "stage_pools", None)
-                        replica_id = (
-                            stage_pools[omni_res.stage_id].get_bound_replica_id(request_id)
-                            if stage_pools is not None and 0 <= omni_res.stage_id < len(stage_pools)
-                            else None
-                        )
-                        observe_audio_first_packet(
-                            self.engine_client.mod_metrics,
-                            stage_id=omni_res.stage_id,
-                            replica_id=replica_id,
-                            arrival_ts=req_state.request_arrival_ts,
-                            now_ts=now_ts,
-                        )
-
-                    role = self.get_chat_request_role(request)
-                    choices_data = self._create_audio_choice(omni_res, role, request, stream=True)
-                    chunk = OmniChatCompletionStreamResponse(
-                        id=request_id,
-                        object=chunk_object_type,
-                        created=created_time,
-                        choices=choices_data,
-                        model=model_name,
-                        modality=final_output_type,
-                    )
-                    chunk.usage = UsageInfo(
-                        prompt_tokens=num_prompt_tokens,
-                        completion_tokens=0,
-                        total_tokens=num_prompt_tokens,
-                    )
-                    data = chunk.model_dump_json(exclude_unset=True)
-                    yield f"data: {data}\n\n"
-
-                else:
-                    logger.warning(f"Unsupported streaming final output type: {final_output_type}")
-                    continue
+                    else:
+                        logger.warning(f"Unsupported streaming final output type: {final_output_type}")
+                        continue
 
             # once the final token is handled, if stream_options.include_usage
             # is sent, send the usage

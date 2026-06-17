@@ -35,6 +35,7 @@ from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
+import nvtx
 
 if TYPE_CHECKING:
     from vllm.inputs.preprocess import InputPreprocessor
@@ -516,50 +517,54 @@ class AsyncOmni(EngineClient, OmniBase):
             return
 
         while True:
-            result = await req_state.queue.get()
+            with nvtx.annotate(f"{request_id} async_omni_get_result {req_state.queue.qsize()}"):
+                with nvtx.annotate(f"wait for get req_state",color="red"):
+                    result = await req_state.queue.get()
 
-            stage_id = result.get("stage_id", 0)
+                stage_id = result.get("stage_id", 0)
 
-            if result.get("type") == "error" and result.get("fatal"):
-                raise OmniEngineDeadError(
-                    result.get("error", ""),
-                    error_stage_id=result.get("stage_id"),
-                )
+                if result.get("type") == "error" and result.get("fatal"):
+                    raise OmniEngineDeadError(
+                        result.get("error", ""),
+                        error_stage_id=result.get("stage_id"),
+                    )
 
-            # Check for errors
-            if "error" in result:
-                logger.error(
-                    "[AsyncOmni] Orchestrator error for req=%s stage-%s: %s",
-                    request_id,
+                # Check for errors
+                if "error" in result:
+                    logger.error(
+                        "[AsyncOmni] Orchestrator error for req=%s stage-%s: %s",
+                        request_id,
+                        stage_id,
+                        result["error"],
+                    )
+                    raise RuntimeError(result)
+                if stage_id==2:
+                    logger.info(f"{request_id} output request {result.get("request_id")}, {request_id==result.get("request_id")}")
+
+                self._check_engine_output_error(result, request_id, stage_id)
+
+                # Process the result (constructs OmniRequestOutput)
+                output_to_yield = self._process_single_result(
+                    result,
                     stage_id,
-                    result["error"],
+                    metrics,
+                    req_start_ts,
+                    wall_start_ts,
+                    final_stage_id_for_e2e,
                 )
-                raise RuntimeError(result)
 
-            self._check_engine_output_error(result, request_id, stage_id)
+                if output_to_yield:
+                    logger.debug(
+                        "[AsyncOmni] req=%s stage-%s yielding final_output_type=%s",
+                        request_id,
+                        stage_id,
+                        getattr(output_to_yield, "final_output_type", None),
+                    )
+                    yield output_to_yield
 
-            # Process the result (constructs OmniRequestOutput)
-            output_to_yield = self._process_single_result(
-                result,
-                stage_id,
-                metrics,
-                req_start_ts,
-                wall_start_ts,
-                final_stage_id_for_e2e,
-            )
-
-            if output_to_yield:
-                logger.debug(
-                    "[AsyncOmni] req=%s stage-%s yielding final_output_type=%s",
-                    request_id,
-                    stage_id,
-                    getattr(output_to_yield, "final_output_type", None),
-                )
-                yield output_to_yield
-
-            # The Orchestrator sets "finished" when the final stage is done
-            if result.get("finished"):
-                break
+                # The Orchestrator sets "finished" when the final stage is done
+                if result.get("finished"):
+                    break
 
     # ==================== Output Handler ====================
 
