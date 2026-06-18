@@ -538,8 +538,6 @@ class AsyncOmni(EngineClient, OmniBase):
                         result["error"],
                     )
                     raise RuntimeError(result)
-                if stage_id==2:
-                    logger.info(f"{request_id} output request {result.get("request_id")}, {request_id==result.get("request_id")}")
 
                 self._check_engine_output_error(result, request_id, stage_id)
 
