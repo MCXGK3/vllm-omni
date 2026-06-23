@@ -1009,7 +1009,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 # Flatten nested dicts to dotted keys so pooling_output
                 # stays dict[str, torch.Tensor] for msgspec serialization.
                 pooler_output.append(flatten_payload(payload))
-                if get_tp_group().is_first_rank:
+                if get_tp_group().world_size>1 and get_tp_group().is_first_rank:
                     pooler_output=IPCTensor.wrap_cuda_tensors(pooler_output)
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.routed_experts_initialized:

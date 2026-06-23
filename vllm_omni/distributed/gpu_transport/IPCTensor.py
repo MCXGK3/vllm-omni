@@ -57,7 +57,7 @@ class IPCTensor:
         # 持有原始 tensor 引用，防止 GC 提前释放 IPC 内存
         nvtx.mark(f"{tensor} is {self.is_cuda}")
         self._tensor = tensor
-    @nvtx.annotate("IPC Tensor reduce")
+    # @nvtx.annotate("IPC Tensor reduce")
     def __reduce__(self):
         if self._fallback_cpu is not None:
             return (_rebuild_cpu_tensor_to_device,

@@ -517,9 +517,9 @@ class AsyncOmni(EngineClient, OmniBase):
             return
 
         while True:
-            with nvtx.annotate(f"{request_id} async_omni_get_result {req_state.queue.qsize()}"):
-                with nvtx.annotate(f"wait for get req_state",color="red"):
-                    result = await req_state.queue.get()
+            # with nvtx.annotate(f"{request_id} async_omni_get_result {req_state.queue.qsize()}"):
+                # with nvtx.annotate(f"wait for get req_state",color="red"):
+                result = await req_state.queue.get()
 
                 stage_id = result.get("stage_id", 0)
 
