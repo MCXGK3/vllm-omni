@@ -411,12 +411,13 @@ class OmniGPUModelRunner(GPUModelRunner):
                         else sampling_params.prompt_logprobs
                     )
                 # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
-                if self.uses_mrope:
-                    self._init_mrope_positions(req_state)
+                with nvtx_range("omni:init_positions"):
+                    if self.uses_mrope:
+                        self._init_mrope_positions(req_state)
 
-                # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
-                if self.uses_xdrope_dim > 0:
-                    self._init_xdrope_positions(req_state)
+                    # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
+                    if self.uses_xdrope_dim > 0:
+                        self._init_xdrope_positions(req_state)
 
                 reqs_to_add.append(self.requests[req_id])
 
