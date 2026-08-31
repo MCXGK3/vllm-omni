@@ -180,6 +180,9 @@ class Qwen3OmniMoeForConditionalGeneration(
                 ("hidden_states", "last"),
                 ("hidden_states", "trailing_text"),
                 ("embed", "tts_pad_projected"),
+                
+                ("embed", "prefill"),
+                ("hidden_states", "output"),
             }
             # Keys that need to be accumulated across streaming inputs
             self.streaming_accumulated_keys: set[tuple[str, str]] = {
