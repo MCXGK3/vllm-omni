@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import fcntl
+import json
+import os
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from time import time
@@ -25,6 +28,7 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
     OmniChunkTransferAdapter,
 )
 from vllm_omni.engine.serialization import deserialize_additional_information
+import nvtx
 
 logger = init_logger(__name__)
 
@@ -78,6 +82,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
         self.stage_id = self.vllm_config.model_config.stage_id
+        self.index=0
+        self.index_time:dict[int,float]={}
+        self.time=0
+
+        # Track requests whose prefill completion has been recorded
+        self._prefill_recorded_reqs: set[str] = set()
+        self.records=[]
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -191,6 +202,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return False
 
     def schedule(self) -> SchedulerOutput:  # type: ignore[override]
+        self.index+=1
+        self.time=time()
+        self.index_time[self.index]=self.time
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
 
@@ -207,9 +221,18 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # Rewrap base NewRequestData entries with OmniNewRequestData,
             # enriching with request-level payloads
             new_list = []
+            if len(scheduler_output.scheduled_new_reqs)!=0:
+                logger.info(f"StageID {self.stage_id}, index={self.index}, num={len(scheduler_output.scheduled_new_reqs)}")
+                self._record_prefill_num(self.stage_id,self.index,len(scheduler_output.scheduled_new_reqs))
+                if self.stage_id==1:
+                    pass
+                    # nvtx.mark(f"index={self.index},num={len(scheduler_output.scheduled_new_reqs)},")
             for nr in scheduler_output.scheduled_new_reqs:
                 req_id = getattr(nr, "req_id", None)
                 request = self.requests.get(req_id) if req_id else None
+                if self.stage_id==0:
+                    self._record_prefill_completion(0,req_id,"STAGE0 ARRIVAL",-1,request.arrival_time)
+                self._record_prefill_completion(self.stage_id,req_id,f"STAGE{self.stage_id} SCHEDULE",self.index,time())
                 # Build omni entry preserving all base fields
                 omni_nr = OmniNewRequestData(
                     req_id=nr.req_id,
@@ -324,6 +347,21 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
 
+            # Detect prefill completion: record time from arrival to prefill done
+            flag=False
+            if req_id not in self._prefill_recorded_reqs:
+                # if request.num_computed_tokens >= request.num_prompt_tokens and self.stage_id==1:
+                if self.stage_id==1 or self.stage_id==0:
+                    flag=True
+                    # num_computed_tokens already includes this step's tokens.
+                    # Check that prefill was NOT already complete before this step.
+                    tokens_before_step = request.num_computed_tokens - num_tokens_scheduled
+                    if tokens_before_step < request.num_prompt_tokens:
+                        self._prefill_recorded_reqs.add(req_id)
+                        self._record_prefill_completion(self.stage_id,req_id,f"STAGE{self.stage_id} UPDATE",self.index,time())
+            if flag:
+                logger.info(f"index={self.index}, cost {time()-self.time}")
+                # nvtx.mark(f"index={self.index}, cost {time()-self.time} req_id={req_id}")
             scheduled_spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             if scheduled_spec_token_ids and generated_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
@@ -719,6 +757,52 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.requests_needing_kv_transfer[req_id] = {"seq_len": seq_len, "block_ids": block_ids}
             logger.debug(f"Marked request {req_id} for KV cache transfer (len={seq_len}, blocks={len(block_ids)})")
 
+    @staticmethod
+    def _record_prefill_num(stage_id:int,index:int,num:int)->None:
+        """Record prefill num to ~/record_num.json"""
+        record_path = os.path.expanduser("/home/record_num.json")
+        record = {"stage_id":stage_id,"index":index,"num":num}
+        
+        existing=[]
+        try:
+            with open(record_path,"r") as f:
+                existing=json.load(f)
+                if not isinstance(existing,list):
+                    existing=[]
+        except (FileNotFoundError, json.JSONDecodeError):
+            existing = []
+        existing.append(record)
+        try:
+            with open(record_path, "w") as f:
+                json.dump(existing, f, indent=2)
+            logger.debug(f"Recorded prefill num for {stage_id}: {num:.4f}s")
+        except Exception:
+            logger.exception("Failed to write prefill num record for %s", stage_id)
+        
+        
+    def _record_prefill_completion(self,stage_id:int,req_id: str,event:str,index:int,time:float) -> None:
+        record = {"stage_id":stage_id,"req_id": req_id, "event":event,"index":index,"time":time}
+        nvtx.mark(str(record))
+        self.records.append(record)
+        record_path=f"/home/record.jsonl"
+        try:
+            with open(
+                record_path,
+                "a",
+                encoding="utf-8"
+            ) as f:
+                f.write(
+                    json.dumps(
+                        record,
+                        ensure_ascii=False
+                    ) + "\n"
+                )
+
+        except Exception:
+            logger.exception(
+                "Failed to write prefill completion record for %s",
+                req_id
+            )
     def _should_transfer_kv_for_request(self, req_id: str) -> bool:
         """Determine if a request should trigger KV cache transfer."""
         need_send = False
@@ -771,7 +855,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         self.requests_needing_kv_transfer.clear()
         return requests
-
-
+    
+    def shutdown(self)->None:
+        super().shutdown()
 class OmniARAsyncScheduler(OmniARScheduler, AsyncVLLMScheduler):
     """Asynchronous AutoRegressive scheduler."""

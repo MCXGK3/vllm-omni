@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import fcntl
 import importlib
+import json
+import os
 import time
 from collections import defaultdict, deque
 from typing import Any
 
+import nvtx
 import torch
 from vllm.v1.request import Request, RequestStatus
 
@@ -62,6 +66,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
         self.requests_with_ready_chunks = set()
         self.requests_origin_status = {}
+        
+        self.got_first_chunk_requests=set()
+        self.records=[]
 
     @classmethod
     def create_connector(cls, model_config: Any):
@@ -139,6 +146,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # Use timeout=0 for non-blocking poll
         try:
             t0 = time.perf_counter()
+            before_get_time=time.time()
             result = self.connector.get(
                 str(target_stage_id),
                 str(stage_id),
@@ -197,6 +205,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 "get stage=%s->%s req=%s chunk=%s size=%d get_ms=%.2f",
                 target_stage_id, stage_id, external_req_id, chunk_id, size, get_ms,
             )
+            if chunk_id==0 and stage_id==1 and request.request_id not in self.got_first_chunk_requests:
+                self._record_prefill_completion(stage_id,request.request_id,"CHUNK0 BEGIN GET",-1,before_get_time)
+                self._record_prefill_completion(stage_id,request.request_id,"CHUNK0 GET",-1,time.time())
+                self.got_first_chunk_requests.add(request.request_id)
+                # nvtx.mark(f"{request.request_id} got first chunk")
             return True
 
         return False
@@ -230,6 +243,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         return payload_data
 
     def _send_single_request(self, task: dict):
+        # nvtx.mark(f"_send_single_request {task.get("request").request_id}")
         raw_po = task["pooling_output"]
         pooling_output = unflatten_payload(raw_po) if isinstance(raw_po, dict) else raw_po
         request = task["request"]
@@ -256,6 +270,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return
 
         t0 = time.perf_counter()
+        if chunk_id==0 and stage_id==0:
+            self._record_prefill_completion(0,request.request_id,"CHUNK0 PUT",-1,time.time())
         success, size, metadata = self.connector.put(
             from_stage=str(stage_id),
             to_stage=str(next_stage_id),
@@ -263,8 +279,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             data=payload_data,
         )
         put_ms = (time.perf_counter() - t0) * 1000.0
+        
 
         if success:
+            if chunk_id==0 and stage_id==0:
+                self._record_prefill_completion(0,request.request_id,"CHUNK0 PUT OVER",-1,time.time())
             self.put_req_chunk[external_req_id] += 1
             logger.debug(
                 "put stage=%s->%s req=%s chunk=%s size=%d put_ms=%.2f",
@@ -478,3 +497,28 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 continue
             if req_id in self.requests_origin_status:
                 request.status = self.requests_origin_status.pop(req_id)
+
+    def _record_prefill_completion(self,stage_id:int,req_id: str,event:str,index:int,time:float) -> None:
+        """Record prefill completion latency to ~/record.json."""
+        record = {"stage_id":stage_id,"req_id": req_id, "event":event,"index":index,"time":time}
+        nvtx.mark(str(record))
+        self.records.append(record)
+        record_path=f"/home/record.jsonl"
+        try:
+            with open(
+                record_path,
+                "a",
+                encoding="utf-8"
+            ) as f:
+                f.write(
+                    json.dumps(
+                        record,
+                        ensure_ascii=False
+                    ) + "\n"
+                )
+
+        except Exception:
+            logger.exception(
+                "Failed to write prefill completion record for %s",
+                req_id
+            )
