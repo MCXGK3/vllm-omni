@@ -1570,28 +1570,18 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         video_pos = np.stack([t_index, h_index, w_index]) + start_idx
         audio_pos = np.broadcast_to(np.arange(audio_len), (3, audio_len)) + start_idx
 
-        video_t_values = video_pos[0]
-        audio_t_values = audio_pos[0]
-
-        pos_ids_list: list[np.ndarray] = []
-        video_idx, audio_idx = 0, 0
         num_video = grid_t * grid_h * grid_w
-
-        while video_idx < num_video and audio_idx < audio_len:
-            if video_t_values[video_idx] <= audio_t_values[audio_idx]:
-                pos_ids_list.append(video_pos[:, video_idx : video_idx + 1])
-                video_idx += 1
-            else:
-                pos_ids_list.append(audio_pos[:, audio_idx : audio_idx + 1])
-                audio_idx += 1
-
-        if video_idx < num_video:
-            pos_ids_list.append(video_pos[:, video_idx:])
-        if audio_idx < audio_len:
-            pos_ids_list.append(audio_pos[:, audio_idx:])
-
         total_tokens = num_video + audio_len
-        return np.concatenate(pos_ids_list, axis=1), total_tokens
+
+        # Vectorized merge of video and audio positions, sorted by the temporal
+        # dimension. Ties are broken video-first, matching the original
+        # `video_t_values <= audio_t_values` while-loop exactly (both sequences
+        # are internally sorted, so a global lexsort reproduces the same order).
+        all_pos = np.concatenate([video_pos, audio_pos], axis=1)  # [3, total_tokens]
+        priority = np.zeros(total_tokens, dtype=np.int8)
+        priority[num_video:] = 1
+        order = np.lexsort((np.arange(total_tokens), priority, all_pos[0]))
+        return all_pos[:, order], total_tokens
 
     @classmethod
     def get_speech_to_text_config(cls, model_config: ModelConfig, task_type: str) -> SpeechToTextConfig:

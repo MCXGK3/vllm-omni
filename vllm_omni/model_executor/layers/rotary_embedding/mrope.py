@@ -11,6 +11,7 @@ for computing input positions for various multimodal scenarios including:
 - GLM4V style inputs
 """
 
+import bisect
 import itertools
 
 import torch
@@ -235,18 +236,25 @@ class OmniMRotaryEmbedding(MRotaryEmbedding):
         video_nums = (vision_tokens == video_token_id).sum()
         llm_pos_ids_list: list = []
 
+        # Precompute sorted mm-token positions to avoid O(n) list.index() scans
+        # inside the per-feature loop below.
+        image_positions = [i for i, t in enumerate(input_tokens) if t == image_token_id]
+        video_positions = [i for i, t in enumerate(input_tokens) if t == video_token_id]
+
         st = 0
         remain_images, remain_videos = image_nums, video_nums
 
         image_index, video_index = 0, 0
         for _ in range(image_nums + video_nums):
             video_second_per_grid_t = 0.0
-            if image_token_id in input_tokens and remain_images > 0:
-                ed_image = input_tokens.index(image_token_id, st)
+            if remain_images > 0:
+                pos = bisect.bisect_left(image_positions, st)
+                ed_image = image_positions[pos] if pos < len(image_positions) else len(input_tokens) + 1
             else:
                 ed_image = len(input_tokens) + 1
-            if video_token_id in input_tokens and remain_videos > 0:
-                ed_video = input_tokens.index(video_token_id, st)
+            if remain_videos > 0:
+                pos = bisect.bisect_left(video_positions, st)
+                ed_video = video_positions[pos] if pos < len(video_positions) else len(input_tokens) + 1
             else:
                 ed_video = len(input_tokens) + 1
             if ed_image < ed_video:
@@ -369,30 +377,64 @@ class OmniMRotaryEmbedding(MRotaryEmbedding):
         new_src_item: list[int] = []
         llm_pos_ids_list: list[torch.Tensor] = []
 
+        # st_idx tracks the start index for the *next* position chunk, which is
+        # equivalent to `max(llm_pos_ids_list[-1]) + 1` without scanning the list.
+        st_idx = 0
+        # Consecutive plain text tokens are batched and emitted as one arange
+        # instead of creating a tiny 3x1 tensor per token.
+        text_count = 0
+
+        def flush_text() -> None:
+            nonlocal st_idx, text_count
+            if text_count > 0:
+                llm_pos_ids_list.append(
+                    torch.arange(text_count, dtype=torch.long).view(1, -1).expand(3, -1) + st_idx
+                )
+                st_idx += text_count
+                text_count = 0
+
         idx = 0
         while idx < len(src_item):
             new_src_item_len = len(new_src_item)
-            start_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
-            if src_item[idx] not in [audio_token_id, video_token_id, image_token_id]:
+            token = src_item[idx]
+            if token not in [audio_token_id, video_token_id, image_token_id]:
                 if use_audio_in_video and idx > 0:
-                    if src_item[idx] == vision_end_token_id and src_item[idx - 1] == audio_end_token_id:
+                    if token == vision_end_token_id and src_item[idx - 1] == audio_end_token_id:
                         # processing the <|audio_eos|> before <|vision_eos|>
-                        start_idx -= 1
-                    elif src_item[idx] == audio_start_token_id and src_item[idx - 1] == vision_start_token_id:
+                        new_src_item.append(token)
+                        flush_text()
+                        # Reuse the previous position id; st_idx stays unchanged.
+                        llm_pos_ids_list.append(
+                            torch.tensor([st_idx - 1], dtype=torch.long).view(1, -1).expand(3, -1)
+                        )
+                        idx += 1
+                        continue
+                    if token == audio_start_token_id and src_item[idx - 1] == vision_start_token_id:
                         # processing the <|audio_bos|> after <|vision_eos|>
-                        start_idx -= 1
-                new_src_item.append(src_item[idx])
-                llm_pos_ids = torch.tensor([start_idx], dtype=torch.long).expand(3, -1)
-                llm_pos_ids_list.append(llm_pos_ids)
-            elif src_item[idx] == audio_token_id:
+                        new_src_item.append(token)
+                        flush_text()
+                        # Reuse the previous position id; st_idx stays unchanged.
+                        llm_pos_ids_list.append(
+                            torch.tensor([st_idx - 1], dtype=torch.long).view(1, -1).expand(3, -1)
+                        )
+                        idx += 1
+                        continue
+                new_src_item.append(token)
+                text_count += 1
+            elif token == audio_token_id:
+                flush_text()
+                start_idx = st_idx
                 assert audio_seqlens is not None
                 audio_seqlen = audio_seqlens[audio_idx]
                 place_num = ((audio_seqlen - 1) // 2 + 1 - 2) // 2 + 1
                 new_src_item.extend([audio_token_id] * place_num)
                 llm_pos_ids = torch.arange(place_num).expand(3, -1) + start_idx
                 llm_pos_ids_list.append(llm_pos_ids)
+                st_idx += place_num
                 audio_idx += 1
-            elif src_item[idx] == image_token_id:
+            elif token == image_token_id:
+                flush_text()
+                start_idx = st_idx
                 grid_t = image_grid_thw[image_idx][0]
                 grid_hs = image_grid_thw[:, 1]
                 grid_ws = image_grid_thw[:, 2]
@@ -401,10 +443,15 @@ class OmniMRotaryEmbedding(MRotaryEmbedding):
                     start_idx, image_idx, spatial_merge_size, t_index, grid_hs, grid_ws
                 )
                 llm_pos_ids_list.append(llm_pos_ids)
+                # Note: positions are not contiguous (t dim is scaled), so the
+                # next start is max+1, not start_idx + vision_seqlen.
+                st_idx = int(llm_pos_ids.max()) + 1
                 vision_seqlen = image_grid_thw[image_idx].prod() // (spatial_merge_size**2)
                 new_src_item.extend([image_token_id] * vision_seqlen)
                 image_idx += 1
-            elif src_item[idx] == video_token_id and not use_audio_in_video:
+            elif token == video_token_id and not use_audio_in_video:
+                flush_text()
+                start_idx = st_idx
                 grid_t = video_grid_thw[video_idx][0]
                 grid_hs = video_grid_thw[:, 1]
                 grid_ws = video_grid_thw[:, 2]
@@ -413,11 +460,14 @@ class OmniMRotaryEmbedding(MRotaryEmbedding):
                     start_idx, video_idx, spatial_merge_size, t_index, grid_hs, grid_ws
                 )
                 llm_pos_ids_list.append(llm_pos_ids)
+                st_idx = int(llm_pos_ids.max()) + 1
                 vision_seqlen = video_grid_thw[video_idx].prod() // (spatial_merge_size**2)
                 new_src_item.extend([video_token_id] * vision_seqlen)
                 video_idx += 1
             else:
                 # read audio from video
+                flush_text()
+                start_idx = st_idx
                 assert audio_seqlens is not None
                 audio_seqlen = audio_seqlens[audio_idx]
                 vision_seqlen = video_grid_thw[video_idx].prod() // (spatial_merge_size**2)
@@ -464,13 +514,16 @@ class OmniMRotaryEmbedding(MRotaryEmbedding):
                         torch.arange(pure_audio_len - added_audio_len).expand(3, -1) + llm_pos_ids_list[-1].max() + 1
                     ).split(1, dim=1)
                     llm_pos_ids_list.extend(audio_llm_pos_ids_list)
+                st_idx = int(llm_pos_ids_list[-1].max()) + 1
                 audio_idx += 1
                 video_idx += 1
             # move to the next token
             idx += len(new_src_item) - new_src_item_len
 
+        flush_text()
+
         llm_positions = torch.cat(llm_pos_ids_list, dim=1)
-        mrope_position_delta = torch.cat(llm_pos_ids_list, dim=1).max() + 1 - len(src_item)
+        mrope_position_delta = llm_positions.max() + 1 - len(src_item)
         llm_positions = llm_positions[:, context_len:seq_len]
 
         return llm_positions, mrope_position_delta
