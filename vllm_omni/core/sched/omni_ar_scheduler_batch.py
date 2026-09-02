@@ -54,7 +54,7 @@ class BatchOrderOmniARScheduler(OmniARScheduler):
         super().__init__(*args, **kwargs)
 
         fixed_batch_size = int(os.getenv("VLLM_OMNI_FIXED_BATCH_SIZE", "0"))
-        if fixed_batch_size > 0 and self.stage_id == 0:
+        if fixed_batch_size > 0 and self.stage_id in (0, 1):
             self._batch_order = [[str(i) for i in range(fixed_batch_size)]]
         else:
             self._batch_order: list[list[str]] = batch_order or ([["2","3","6","8"],["1","9"]] if self.stage_id==1 else [])
