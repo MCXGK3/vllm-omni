@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 import re
 import warnings
 from collections.abc import Callable
@@ -151,10 +152,12 @@ def _resolve_scheduler(
     """
     if execution_type == StageExecutionType.LLM_AR:
         if not async_scheduling:
+            if int(os.getenv("VLLM_OMNI_FIXED_BATCH_SIZE", "0")) > 0:
+                return BatchOrderOmniARScheduler
             return OmniARScheduler
-            # return BatchOrderOmniARScheduler
+        if int(os.getenv("VLLM_OMNI_FIXED_BATCH_SIZE", "0")) > 0:
+            return BatchOrderOmniARAsyncScheduler
         return OmniARAsyncScheduler
-        # return BatchOrderOmniARAsyncScheduler
     if execution_type == StageExecutionType.LLM_GENERATION:
         return OmniGenerationScheduler
     # Diffusion currently returns None here.

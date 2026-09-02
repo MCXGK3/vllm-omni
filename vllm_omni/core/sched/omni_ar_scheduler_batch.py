@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from collections import deque
 from typing import Any
@@ -52,12 +53,15 @@ class BatchOrderOmniARScheduler(OmniARScheduler):
     def __init__(self, *args, batch_order: list[list[str]] | None = None, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # ---- batch specification -------------------------------------------
-        self._batch_order: list[list[str]] = batch_order or ([["2","3","6","8"],["1","9"]] if self.stage_id==1 else [])
-        if self.stage_id==0:
-            self._batch_order=[['1','2'],['3','4'],['5','6'],['7','8']]
-        elif self.stage_id==1:
-            self._batch_order=[]
+        fixed_batch_size = int(os.getenv("VLLM_OMNI_FIXED_BATCH_SIZE", "0"))
+        if fixed_batch_size > 0 and self.stage_id == 0:
+            self._batch_order = [[str(i) for i in range(fixed_batch_size)]]
+        else:
+            self._batch_order: list[list[str]] = batch_order or ([["2","3","6","8"],["1","9"]] if self.stage_id==1 else [])
+            if self.stage_id==0:
+                self._batch_order=[["1","2"],["3","4"],["5","6"],["7","8"]]
+            elif self.stage_id==1:
+                self._batch_order=[]
             
         # suffix → batch_index (0-based).  If a suffix appears in multiple
         # batches the constructor raises ValueError.
@@ -254,7 +258,7 @@ class BatchOrderOmniARScheduler(OmniARScheduler):
             # the adapter's "keys absent from the new chunk are dropped"
             # merge rule) — which later crashes talker_preprocess_prefill
             # with `KeyError: 'prefill'`.
-            if self.chunk_transfer_adapter is not None:
+            if self.chunk_transfer_adapter is not None and self.stage_id != 0:
                 self.chunk_transfer_adapter.requests_with_ready_chunks.add(req_id)
             self._enqueue_waiting_request(request)
             promoted += 1
@@ -351,7 +355,7 @@ class BatchOrderOmniARScheduler(OmniARScheduler):
 
         # Start chunk loading immediately so that by the time the batch
         # becomes eligible, data may already be ready.
-        if self.chunk_transfer_adapter is not None:
+        if self.chunk_transfer_adapter is not None and self.stage_id != 0:
             self.chunk_transfer_adapter.load_async(request)
             request.status = RequestStatus.WAITING_FOR_CHUNK
 
@@ -483,7 +487,7 @@ class BatchOrderOmniARScheduler(OmniARScheduler):
                         self._pending_batch_requests[req.request_id] = req
                         # Un-mark chunk readiness: the request is back in
                         # pending and not about to be scheduled.
-                        if self.chunk_transfer_adapter is not None:
+                        if self.chunk_transfer_adapter is not None and self.stage_id != 0:
                             self.chunk_transfer_adapter.requests_with_ready_chunks.discard(
                                 req.request_id,
                             )
