@@ -19,6 +19,7 @@ from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, to_dict
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+from vllm_omni.core.sched.omni_ar_scheduler_batch import BatchOrderOmniARScheduler,BatchOrderOmniARAsyncScheduler
 
 _MODELS_DIR = Path(__file__).resolve().parent.parent / "model_executor" / "models"
 
@@ -151,7 +152,9 @@ def _resolve_scheduler(
     if execution_type == StageExecutionType.LLM_AR:
         if not async_scheduling:
             return OmniARScheduler
+            # return BatchOrderOmniARScheduler
         return OmniARAsyncScheduler
+        # return BatchOrderOmniARAsyncScheduler
     if execution_type == StageExecutionType.LLM_GENERATION:
         return OmniGenerationScheduler
     # Diffusion currently returns None here.
