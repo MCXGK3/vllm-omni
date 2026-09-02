@@ -206,8 +206,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 target_stage_id, stage_id, external_req_id, chunk_id, size, get_ms,
             )
             if chunk_id==0 and stage_id==1 and request.request_id not in self.got_first_chunk_requests:
-                self._record_prefill_completion(stage_id,request.request_id,"CHUNK0 BEGIN GET",-1,before_get_time)
-                self._record_prefill_completion(stage_id,request.request_id,"CHUNK0 GET",-1,time.time())
+                self._record_prefill_completion(stage_id,request.request_id,"CHUNK0 BEGIN GET",len(request.prompt_token_ids),before_get_time)
+                self._record_prefill_completion(stage_id,request.request_id,"CHUNK0 GET",len(request.prompt_token_ids),time.time())
+                # nvtx.mark(f"{request.request_id} len is {len(request.prompt_token_ids)}")
                 self.got_first_chunk_requests.add(request.request_id)
                 # nvtx.mark(f"{request.request_id} got first chunk")
             return True
@@ -271,7 +272,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         t0 = time.perf_counter()
         if chunk_id==0 and stage_id==0:
-            self._record_prefill_completion(0,request.request_id,"CHUNK0 PUT",-1,time.time())
+            self._record_prefill_completion(0,request.request_id,"CHUNK0 PUT",len(request.prompt_token_ids),time.time())
         success, size, metadata = self.connector.put(
             from_stage=str(stage_id),
             to_stage=str(next_stage_id),
@@ -284,6 +285,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if success:
             if chunk_id==0 and stage_id==0:
                 self._record_prefill_completion(0,request.request_id,"CHUNK0 PUT OVER",-1,time.time())
+                self._record_prefill_completion(0,request.request_id,"SIZE",-1,len(request.prompt_token_ids))
+                # nvtx.mark(f"{request.request_id} len is {len(request.prompt_token_ids)}")
             self.put_req_chunk[external_req_id] += 1
             logger.debug(
                 "put stage=%s->%s req=%s chunk=%s size=%d put_ms=%.2f",
