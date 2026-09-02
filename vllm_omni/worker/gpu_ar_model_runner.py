@@ -6,6 +6,10 @@ and also outputs sampled tokens.
 
 from __future__ import annotations
 
+import fcntl
+import json
+import os
+import time
 from contextlib import nullcontext
 from copy import copy
 from dataclasses import replace
@@ -83,6 +87,67 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
         self._downstream_payload_cache: dict[str, bool] = {}
+        self._prefill_timing_enabled = os.getenv("VLLM_OMNI_PREFILL_TIMING", "0") == "1"
+        self._prefill_timing_seq = 0
+
+    def _record_prefill_forward_timing(
+        self,
+        scheduler_output: SchedulerOutput,
+        start_time: float,
+        end_time: float,
+        *,
+        device_synchronized: bool,
+    ) -> None:
+        """Write one actual AR forward timing sample for Thinker/Talker."""
+        if not self._prefill_timing_enabled:
+            return
+
+        req_ids = list(scheduler_output.num_scheduled_tokens.keys())
+        prefill_req_ids: list[str] = []
+        decode_req_ids: list[str] = []
+        prefill_tokens = 0
+        for req_id in req_ids:
+            request = self.requests.get(req_id)
+            req_index = self.input_batch.req_id_to_index.get(req_id)
+            if request is None or req_index is None:
+                continue
+            computed_tokens = int(self.input_batch.num_computed_tokens_cpu[req_index])
+            scheduled_tokens = int(scheduler_output.num_scheduled_tokens[req_id])
+            prompt_tokens = int(getattr(request, "num_prompt_tokens", 0))
+            prompt_part = max(0, min(scheduled_tokens, prompt_tokens - computed_tokens))
+            if prompt_part > 0:
+                prefill_req_ids.append(req_id)
+                prefill_tokens += prompt_part
+            else:
+                decode_req_ids.append(req_id)
+
+        self._prefill_timing_seq += 1
+        record = {
+            "seq": self._prefill_timing_seq,
+            "stage_id": int(getattr(self.model_config, "stage_id", -1)),
+            "stage_name": str(getattr(self.model_config, "model_stage", "unknown")),
+            "batch_size": len(prefill_req_ids),
+            "prefill_tokens": prefill_tokens,
+            "total_batch_requests": len(req_ids),
+            "total_scheduled_tokens": int(scheduler_output.total_num_scheduled_tokens),
+            "decode_requests": len(decode_req_ids),
+            "mixed_prefill_decode": bool(prefill_req_ids and decode_req_ids),
+            "prefill_request_ids": prefill_req_ids,
+            "decode_request_ids": decode_req_ids,
+            "start_time": start_time,
+            "end_time": end_time,
+            "duration_ms": (end_time - start_time) * 1000.0,
+            "device_synchronized": device_synchronized,
+        }
+        record_path = os.getenv("VLLM_OMNI_PREFILL_TIMING_PATH", "/home/prefill_timing.jsonl")
+        try:
+            with open(record_path, "a", encoding="utf-8") as file:
+                fcntl.flock(file.fileno(), fcntl.LOCK_EX)
+                file.write(json.dumps(record, ensure_ascii=False) + "\n")
+                file.flush()
+                fcntl.flock(file.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            logger.exception("Failed to write prefill timing record to %s", record_path)
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -546,6 +611,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            timing_start = 0.0
+            timing_end = 0.0
+            timing_synchronized = False
+            if self._prefill_timing_enabled and torch.cuda.is_available():
+                # Synchronize only in the opt-in research path so this measures
+                # completed GPU work instead of asynchronous launch time.
+                torch.cuda.synchronize()
+                timing_start = time.perf_counter()
+
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -556,6 +630,21 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 logits_index=logits_indices,
                 sampler=self.sampler,
             )
+
+            if self._prefill_timing_enabled and torch.cuda.is_available():
+                torch.cuda.synchronize()
+                timing_end = time.perf_counter()
+                timing_synchronized = True
+            elif self._prefill_timing_enabled:
+                timing_end = time.perf_counter()
+
+            if self._prefill_timing_enabled:
+                self._record_prefill_forward_timing(
+                    scheduler_output,
+                    timing_start,
+                    timing_end,
+                    device_synchronized=timing_synchronized,
+                )
 
             # [Omni] Map pending ropes metadata to req_ids.
             if hasattr(self.model, "flush_pending_metadata"):
