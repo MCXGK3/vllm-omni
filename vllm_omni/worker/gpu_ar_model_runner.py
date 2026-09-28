@@ -6,10 +6,12 @@ and also outputs sampled tokens.
 
 from __future__ import annotations
 
+import atexit
 import fcntl
 import json
 import os
 import time
+from collections import deque
 from contextlib import nullcontext
 from copy import copy
 from dataclasses import replace
@@ -42,10 +44,16 @@ from vllm.v1.worker.gpu_model_runner import (
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
+from vllm_omni.config.future_scheduler_config import load_future_scheduler_config
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
+from vllm_omni.observability.request_gantt import (
+    RequestGanttTraceWriter,
+    env_flag,
+)
+from vllm_omni.core.sched.online_cost_model import OnlineCostModelTrainer
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 from vllm_omni.distributed.gpu_transport.IPCTensor import IPCTensor
@@ -89,6 +97,105 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self._downstream_payload_cache: dict[str, bool] = {}
         self._prefill_timing_enabled = os.getenv("VLLM_OMNI_PREFILL_TIMING", "0") == "1"
         self._prefill_timing_seq = 0
+        stage_id = int(getattr(self.model_config, "stage_id", -1))
+        stage_name = str(getattr(self.model_config, "model_stage", "unknown"))
+        self._request_gantt_writer = (
+            RequestGanttTraceWriter.from_env(
+                stage_id=stage_id,
+                stage_name=stage_name,
+            )
+            if self.is_data_transfer_rank()
+            else None
+        )
+        self._request_gantt_enabled = self._request_gantt_writer is not None
+        prediction_config = load_future_scheduler_config().prediction
+        cost_model_mode = prediction_config.mode.strip().lower()
+        self._online_cost_trainer = (
+            OnlineCostModelTrainer(
+                stage_id=stage_id,
+                graph_max_tokens=prediction_config.graph_capture_max_tokens,
+            )
+            if cost_model_mode in {"collect", "learn"}
+            and self.is_data_transfer_rank()
+            and stage_id in {0, 1}
+            else None
+        )
+        requested_timing_mode = os.getenv(
+            "VLLM_OMNI_REQUEST_GANTT_TIMING_MODE", ""
+        ).strip().lower()
+        if not requested_timing_mode:
+            if self._online_cost_trainer is not None:
+                requested_timing_mode = "cuda_event"
+            else:
+                requested_timing_mode = (
+                    "sync"
+                    if env_flag("VLLM_OMNI_REQUEST_GANTT_SYNC_GPU", default=True)
+                    else "cpu"
+                )
+        if requested_timing_mode not in {"sync", "cuda_event", "cpu"}:
+            logger.warning(
+                "Unknown VLLM_OMNI_REQUEST_GANTT_TIMING_MODE=%r; using cpu",
+                requested_timing_mode,
+            )
+            requested_timing_mode = "cpu"
+        if self._prefill_timing_enabled:
+            # Preserve the legacy prefill timing contract.
+            requested_timing_mode = "sync"
+        if self._online_cost_trainer is not None and requested_timing_mode == "cpu":
+            logger.warning(
+                "Online cost fitting requires GPU completion time; overriding cpu timing with cuda_event"
+            )
+            requested_timing_mode = "cuda_event"
+        self._forward_timing_mode = requested_timing_mode
+        self._forward_timing_enabled = (
+            self._prefill_timing_enabled
+            or self._request_gantt_enabled
+            or self._online_cost_trainer is not None
+        )
+        self._forward_timing_sync_gpu = self._forward_timing_mode == "sync"
+        self._last_forward_timing_record: dict[str, Any] | None = None
+        self._gantt_pending_cuda_events: deque[
+            tuple[Any, Any, str | None, dict[str, Any]]
+        ] = deque()
+        if (
+            (
+                self._request_gantt_writer is not None
+                or self._online_cost_trainer is not None
+            )
+            and self._forward_timing_mode == "cuda_event"
+        ):
+            atexit.register(self._flush_request_gantt_cuda_events)
+
+    def _drain_request_gantt_cuda_events(self, *, force: bool = False) -> None:
+        """Resolve completed CUDA event pairs without blocking the hot path."""
+        writer = self._request_gantt_writer
+        trainer = self._online_cost_trainer
+        if writer is None and trainer is None:
+            return
+        while self._gantt_pending_cuda_events:
+            start_event, end_event, batch_id, record = self._gantt_pending_cuda_events[0]
+            try:
+                if force:
+                    end_event.synchronize()
+                elif not end_event.query():
+                    break
+                duration_ms = float(start_event.elapsed_time(end_event))
+            except Exception:
+                if force:
+                    logger.debug(
+                        "Failed to resolve request Gantt CUDA events during shutdown",
+                        exc_info=True,
+                    )
+                break
+            self._gantt_pending_cuda_events.popleft()
+            if writer is not None and batch_id is not None:
+                writer.record_timing_update(batch_id, duration_ms)
+            if trainer is not None:
+                trainer.observe(record, duration_ms)
+
+    def _flush_request_gantt_cuda_events(self) -> None:
+        """Best-effort flush for the last batch when the worker exits."""
+        self._drain_request_gantt_cuda_events(force=True)
 
     def _record_prefill_forward_timing(
         self,
@@ -97,15 +204,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         end_time: float,
         *,
         device_synchronized: bool,
-    ) -> None:
+        execution_metadata: dict[str, Any] | None = None,
+    ) -> str | None:
         """Write one actual AR forward timing sample for Thinker/Talker."""
-        if not self._prefill_timing_enabled:
-            return
+        if not self._forward_timing_enabled:
+            return None
 
         req_ids = list(scheduler_output.num_scheduled_tokens.keys())
         prefill_req_ids: list[str] = []
         decode_req_ids: list[str] = []
         prefill_tokens = 0
+        request_records: list[dict[str, Any]] = []
         for req_id in req_ids:
             request = self.requests.get(req_id)
             req_index = self.input_batch.req_id_to_index.get(req_id)
@@ -115,11 +224,42 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             scheduled_tokens = int(scheduler_output.num_scheduled_tokens[req_id])
             prompt_tokens = int(getattr(request, "num_prompt_tokens", 0))
             prompt_part = max(0, min(scheduled_tokens, prompt_tokens - computed_tokens))
+            decode_part = max(0, scheduled_tokens - prompt_part)
             if prompt_part > 0:
                 prefill_req_ids.append(req_id)
                 prefill_tokens += prompt_part
-            else:
+                if decode_part > 0:
+                    phase = "prefill_decode"
+                elif computed_tokens == 0:
+                    phase = "initial_prefill"
+                else:
+                    phase = "chunked_prefill"
+            if decode_part > 0:
                 decode_req_ids.append(req_id)
+            if prompt_part == 0:
+                phase = "decode"
+            request_records.append(
+                {
+                    "request_id": req_id,
+                    "global_request_id": self._resolve_global_request_id(req_id),
+                    "prompt_tokens": prompt_tokens,
+                    "computed_tokens_before": computed_tokens,
+                    "scheduled_tokens": scheduled_tokens,
+                    "prefill_tokens": prompt_part,
+                    "decode_tokens": decode_part,
+                    "phase": phase,
+                }
+            )
+
+        initial_prefill_tokens = sum(
+            r["prefill_tokens"] for r in request_records if r["phase"] == "initial_prefill"
+        )
+        chunked_prefill_tokens = sum(
+            r["prefill_tokens"] for r in request_records if r["phase"] == "chunked_prefill"
+        )
+        decode_tokens = sum(
+            r["decode_tokens"] for r in request_records
+        )
 
         self._prefill_timing_seq += 1
         record = {
@@ -132,22 +272,37 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             "total_scheduled_tokens": int(scheduler_output.total_num_scheduled_tokens),
             "decode_requests": len(decode_req_ids),
             "mixed_prefill_decode": bool(prefill_req_ids and decode_req_ids),
+            "initial_prefill_tokens": initial_prefill_tokens,
+            "chunked_prefill_tokens": chunked_prefill_tokens,
+            "decode_tokens": decode_tokens,
+            "requests": request_records,
             "prefill_request_ids": prefill_req_ids,
             "decode_request_ids": decode_req_ids,
             "start_time": start_time,
             "end_time": end_time,
             "duration_ms": (end_time - start_time) * 1000.0,
             "device_synchronized": device_synchronized,
+            "execution": execution_metadata or {},
         }
-        record_path = os.getenv("VLLM_OMNI_PREFILL_TIMING_PATH", "/home/prefill_timing.jsonl")
-        try:
-            with open(record_path, "a", encoding="utf-8") as file:
-                fcntl.flock(file.fileno(), fcntl.LOCK_EX)
-                file.write(json.dumps(record, ensure_ascii=False) + "\n")
-                file.flush()
-                fcntl.flock(file.fileno(), fcntl.LOCK_UN)
-        except Exception:
-            logger.exception("Failed to write prefill timing record to %s", record_path)
+        self._last_forward_timing_record = record
+        if self._prefill_timing_enabled:
+            record_path = os.getenv(
+                "VLLM_OMNI_PREFILL_TIMING_PATH", "/home/prefill_timing.jsonl"
+            )
+            try:
+                with open(record_path, "a", encoding="utf-8") as file:
+                    fcntl.flock(file.fileno(), fcntl.LOCK_EX)
+                    file.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    file.flush()
+                    fcntl.flock(file.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                logger.exception("Failed to write prefill timing record to %s", record_path)
+        if self._request_gantt_writer is not None:
+            batch_id = self._request_gantt_writer.record_forward(record)
+            if batch_id is not None:
+                record["batch_id"] = batch_id
+            return batch_id
+        return None
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -368,6 +523,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
+
+        if self._forward_timing_mode == "cuda_event":
+            self._drain_request_gantt_cuda_events()
 
         if not getattr(self, "_warmup_state_cleared", False):
             self._warmup_state_cleared = True
@@ -614,10 +772,28 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             timing_start = 0.0
             timing_end = 0.0
             timing_synchronized = False
-            if self._prefill_timing_enabled and torch.cuda.is_available():
-                # Synchronize only in the opt-in research path so this measures
-                # completed GPU work instead of asynchronous launch time.
-                torch.cuda.synchronize()
+            timing_nvtx_pushed = False
+            timing_start_event = None
+            timing_end_event = None
+            if self._forward_timing_enabled and torch.cuda.is_available():
+                # Mark the complete synchronized measurement window for Nsight
+                # Systems. The perf_counter interval below remains the actual
+                # value written to JSONL; this range is only a visual aid.
+                stage_name = str(getattr(self.model_config, "model_stage", "unknown"))
+                torch.cuda.nvtx.range_push(
+                    f"vllm_omni:prefill_forward_timing:{stage_name}"
+                )
+                timing_nvtx_pushed = True
+                if self._forward_timing_mode == "sync":
+                    # Synchronize only in the opt-in research path so this
+                    # measures completed GPU work instead of launch time.
+                    torch.cuda.synchronize()
+                timing_start = time.perf_counter()
+                if self._forward_timing_mode == "cuda_event":
+                    timing_start_event = torch.cuda.Event(enable_timing=True)
+                    timing_end_event = torch.cuda.Event(enable_timing=True)
+                    timing_start_event.record()
+            elif self._forward_timing_enabled:
                 timing_start = time.perf_counter()
 
             model_output = self._model_forward(
@@ -631,20 +807,70 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 sampler=self.sampler,
             )
 
-            if self._prefill_timing_enabled and torch.cuda.is_available():
-                torch.cuda.synchronize()
+            if self._forward_timing_enabled and torch.cuda.is_available():
+                if self._forward_timing_mode == "sync":
+                    torch.cuda.synchronize()
+                    timing_synchronized = True
+                elif timing_end_event is not None:
+                    timing_end_event.record()
                 timing_end = time.perf_counter()
-                timing_synchronized = True
-            elif self._prefill_timing_enabled:
+                if timing_nvtx_pushed:
+                    torch.cuda.nvtx.range_pop()
+            elif self._forward_timing_enabled:
                 timing_end = time.perf_counter()
 
-            if self._prefill_timing_enabled:
-                self._record_prefill_forward_timing(
+            if self._forward_timing_enabled:
+                timing_metadata = {
+                    "timing_mode": self._forward_timing_mode,
+                    "timeline_anchor": (
+                        "cpu_event_enqueue"
+                        if self._forward_timing_mode == "cuda_event"
+                        else "cpu_perf_counter"
+                    ),
+                    "num_tokens_unpadded": int(num_tokens_unpadded),
+                    "num_tokens_padded": int(num_tokens_padded),
+                    "padding_tokens": int(num_tokens_padded - num_tokens_unpadded),
+                    "max_num_scheduled_tokens": int(max_num_scheduled_tokens),
+                    "num_reqs": int(num_reqs),
+                    "num_reqs_padded": int(num_reqs_padded),
+                    "cudagraph_mode": getattr(cudagraph_mode, "name", str(cudagraph_mode)),
+                    "graph_num_unpadded_tokens": getattr(cudagraph_stats, "num_unpadded_tokens", None),
+                    "graph_num_padded_tokens": getattr(cudagraph_stats, "num_padded_tokens", None),
+                    "graph_num_paddings": getattr(cudagraph_stats, "num_paddings", None),
+                    "graph_runtime_mode": getattr(cudagraph_stats, "runtime_mode", None),
+                    "should_ubatch": bool(should_ubatch),
+                    "num_ubatches": len(ubatch_slices_padded) if ubatch_slices_padded is not None else 1,
+                    "use_cascade_attn": cascade_attn_prefix_lens is not None,
+                    "use_spec_decode": bool(use_spec_decode),
+                    "has_separate_kv_update": bool(has_separate_kv_update),
+                    "num_encoder_reqs": len(scheduler_output.scheduled_encoder_inputs),
+                }
+                batch_id = self._record_prefill_forward_timing(
                     scheduler_output,
                     timing_start,
                     timing_end,
                     device_synchronized=timing_synchronized,
+                    execution_metadata=timing_metadata,
                 )
+                timing_record = self._last_forward_timing_record
+                if (
+                    self._online_cost_trainer is not None
+                    and timing_record is not None
+                    and self._forward_timing_mode == "sync"
+                ):
+                    self._online_cost_trainer.observe(
+                        timing_record, (timing_end - timing_start) * 1000.0
+                    )
+                if (
+                    (batch_id is not None or self._online_cost_trainer is not None)
+                    and timing_start_event is not None
+                    and timing_end_event is not None
+                    and timing_record is not None
+                ):
+                    self._gantt_pending_cuda_events.append(
+                        (timing_start_event, timing_end_event, batch_id, timing_record)
+                    )
+                    self._drain_request_gantt_cuda_events()
 
             # [Omni] Map pending ropes metadata to req_ids.
             if hasattr(self.model, "flush_pending_metadata"):

@@ -17,8 +17,13 @@ from typing import Any
 from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
+from vllm_omni.config.future_scheduler_config import load_future_scheduler_config
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, to_dict
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
+from vllm_omni.core.sched.omni_ar_scheduler_cost_aware import (
+    CostAwareOmniARAsyncScheduler,
+    CostAwareOmniARScheduler,
+)
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.core.sched.omni_ar_scheduler_batch import BatchOrderOmniARScheduler,BatchOrderOmniARAsyncScheduler
 
@@ -151,10 +156,15 @@ def _resolve_scheduler(
     For other execution types, async_scheduling is not used.
     """
     if execution_type == StageExecutionType.LLM_AR:
+        future_scheduler_enabled = load_future_scheduler_config().enabled
         if not async_scheduling:
+            if future_scheduler_enabled:
+                return CostAwareOmniARScheduler
             if int(os.getenv("VLLM_OMNI_FIXED_BATCH_SIZE", "0")) > 0:
                 return BatchOrderOmniARScheduler
             return OmniARScheduler
+        if future_scheduler_enabled:
+            return CostAwareOmniARAsyncScheduler
         if int(os.getenv("VLLM_OMNI_FIXED_BATCH_SIZE", "0")) > 0:
             return BatchOrderOmniARAsyncScheduler
         return OmniARAsyncScheduler

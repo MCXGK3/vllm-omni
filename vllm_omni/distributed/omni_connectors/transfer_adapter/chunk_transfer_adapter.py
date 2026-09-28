@@ -4,7 +4,6 @@
 import fcntl
 import importlib
 import json
-import os
 import time
 from collections import defaultdict, deque
 from typing import Any
@@ -13,6 +12,7 @@ import nvtx
 import torch
 from vllm.v1.request import Request, RequestStatus
 
+from vllm_omni.config.future_scheduler_config import load_future_scheduler_config
 from vllm_omni.data_entry_keys import unflatten_payload
 
 from ..factory import OmniConnectorFactory
@@ -43,8 +43,35 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
     def __init__(self, vllm_config: Any):
         model_config = vllm_config.model_config
+        future_config = load_future_scheduler_config()
+        transfer_config = future_config.transfer
+        registry_config = future_config.registry
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         self.connector = self.create_connector(model_config)
+        self._future_registry = None
+        self._future_put_ewma_ms = transfer_config.put_default_ms
+        self._future_get_ewma_ms = transfer_config.get_default_ms
+        self._future_ewma_alpha = min(
+            1.0,
+            max(0.01, transfer_config.ewma_alpha),
+        )
+        self._future_ipc_base_ms = max(0.0, transfer_config.ipc_base_ms)
+        self._future_ipc_bandwidth_gbps = max(
+            0.1, transfer_config.ipc_bandwidth_gbps
+        )
+        self._future_delivery_margin_ms = max(
+            0.0, transfer_config.delivery_margin_ms
+        )
+        self._future_stage1_token_offset = transfer_config.stage1_token_offset
+        if future_config.enabled:
+            from vllm_omni.core.sched.future_request_registry import (
+                FutureRequestRegistry,
+            )
+
+            self._future_registry = FutureRequestRegistry(
+                path=registry_config.path,
+                ttl_s=registry_config.ttl_s,
+            )
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         # State specific to Chunk management
@@ -69,6 +96,121 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         
         self.got_first_chunk_requests=set()
         self.records=[]
+
+    def _future_update_ewma(self, attr: str, value_ms: float) -> None:
+        previous = float(getattr(self, attr))
+        value = max(float(value_ms), 0.0)
+        setattr(
+            self,
+            attr,
+            self._future_ewma_alpha * value
+            + (1.0 - self._future_ewma_alpha) * previous,
+        )
+
+    @staticmethod
+    def _future_payload_nbytes(value: Any) -> int:
+        if isinstance(value, torch.Tensor):
+            return int(value.numel() * value.element_size())
+        if isinstance(value, dict):
+            return sum(
+                OmniChunkTransferAdapter._future_payload_nbytes(item)
+                for item in value.values()
+            )
+        if isinstance(value, (list, tuple)):
+            return sum(
+                OmniChunkTransferAdapter._future_payload_nbytes(item)
+                for item in value
+            )
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return len(value)
+        return 0
+
+    def future_queue_snapshot(self) -> dict[str, float | int]:
+        """Return queue/service state without exposing request payloads."""
+        return {
+            "send_queue_depth": len(self._pending_save_reqs),
+            "recv_queue_depth": len(self._pending_load_reqs),
+            "put_ewma_ms": float(self._future_put_ewma_ms),
+            "get_ewma_ms": float(self._future_get_ewma_ms),
+        }
+
+    def _publish_transfer_ready_hint(
+        self,
+        *,
+        request: Request,
+        payload_data: dict[str, Any],
+        chunk_id: int,
+    ) -> None:
+        """Refresh downstream ETA after compute, immediately before IPC put."""
+        registry = self._future_registry
+        if registry is None:
+            return
+        source_stage = int(self.connector.stage_id)
+        target_stage = source_stage + 1
+        now = time.time()
+        target_state = registry.get_stage_state(target_stage, now=now) or {}
+        payload_nbytes = self._future_payload_nbytes(payload_data)
+        size_service_ms = (
+            payload_nbytes / (self._future_ipc_bandwidth_gbps * 1_000_000.0)
+        )
+        put_ms = max(
+            float(self._future_put_ewma_ms),
+            self._future_ipc_base_ms + size_service_ms,
+        )
+        get_ms = max(
+            float(target_state.get("get_ewma_ms", self._future_get_ewma_ms)),
+            self._future_ipc_base_ms + size_service_ms,
+        )
+        recv_depth = max(0, int(target_state.get("recv_queue_depth", 0)))
+        recv_wait_ms = recv_depth * max(get_ms, 1.0)
+        scheduler_wait_ms = max(
+            0.0, float(target_state.get("scheduler_backlog_ms", 0.0))
+        )
+        eta_ms = (
+            put_ms
+            + recv_wait_ms
+            + get_ms
+            + scheduler_wait_ms
+            + self._future_delivery_margin_ms
+        )
+
+        prompt_tokens = int(getattr(request, "num_prompt_tokens", 0) or 0)
+        next_prompt_tokens = prompt_tokens
+        if source_stage == 0 and target_stage == 1:
+            next_prompt_tokens += self._future_stage1_token_offset
+        is_initial_chunk = chunk_id == 0
+        next_q = next_prompt_tokens if is_initial_chunk else 1
+        computed_before = (
+            0 if is_initial_chunk else next_prompt_tokens + chunk_id - 1
+        )
+        registry.publish(
+            request_id=str(request.request_id),
+            source_stage=source_stage,
+            target_stage=target_stage,
+            sequence=time.time_ns(),
+            published_at=now,
+            ready_at=now + eta_ms / 1000.0,
+            payload={
+                "publication_node": "transfer_ready",
+                "source_stage": source_stage,
+                "target_stage": target_stage,
+                "prompt_tokens": prompt_tokens,
+                "next_prompt_tokens": next_prompt_tokens,
+                "computed_tokens_before": computed_before,
+                "next_scheduled_tokens": max(next_q, 1),
+                "phase": "prefill" if is_initial_chunk else "decode",
+                "chunk_id": int(chunk_id),
+                "payload_nbytes": int(payload_nbytes),
+                "eta_components_ms": {
+                    "put": put_ms,
+                    "recv_queue": recv_wait_ms,
+                    "get": get_ms,
+                    "target_scheduler": scheduler_wait_ms,
+                    "delivery_margin": self._future_delivery_margin_ms,
+                },
+                "ready_at": now + eta_ms / 1000.0,
+            },
+        )
 
     @classmethod
     def create_connector(cls, model_config: Any):
@@ -159,6 +301,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if result is None:
             return False
+        self._future_update_ewma("_future_get_ewma_ms", get_ms)
         payload_data, size = result
 
         if payload_data:
@@ -270,9 +413,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if not payload_data:
             return
 
-        t0 = time.perf_counter()
         if chunk_id==0 and stage_id==0:
             self._record_prefill_completion(0,request.request_id,"CHUNK0 PUT",len(request.prompt_token_ids),time.time())
+        self._publish_transfer_ready_hint(
+            request=request,
+            payload_data=payload_data,
+            chunk_id=chunk_id,
+        )
+        t0 = time.perf_counter()
         success, size, metadata = self.connector.put(
             from_stage=str(stage_id),
             to_stage=str(next_stage_id),
@@ -280,6 +428,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             data=payload_data,
         )
         put_ms = (time.perf_counter() - t0) * 1000.0
+        self._future_update_ewma("_future_put_ewma_ms", put_ms)
         
 
         if success:

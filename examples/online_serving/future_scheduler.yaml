@@ -1,0 +1,45 @@
+# Enable the future-aware scheduler with one environment variable:
+# export VLLM_OMNI_FUTURE_SCHEDULER_CONFIG=/path/to/future_scheduler.yaml
+enabled: true
+
+decision:
+  # Only consider requests expected within this window. Fifty milliseconds
+  # covers the transfer-ready ETA without permitting long GPU-idle waits.
+  max_wait_ms: 100
+  min_wait_ms: 0.1
+  min_gain_ms: 5
+  budget_ms: 0
+  max_future_items: 8
+  decode_queue_margin_ms: 0
+
+registry:
+  path: /dev/shm/vllm_omni_future_requests.sqlite3
+  ttl_s: 120
+  stage_state_max_age_s: 2
+  stage_state_interval_ms: 100
+
+transfer:
+  delivery_margin_ms: 10
+  stage1_token_offset: 6
+  put_default_ms: 1
+  get_default_ms: 1
+  ewma_alpha: 0.2
+  ipc_base_ms: 0.5
+  ipc_bandwidth_gbps: 20
+
+prediction:
+  # static, collect, learn, or fitted
+  mode: static
+  graph_capture_max_tokens: 128
+  model_path: /dev/shm/vllm_omni_online_cost_model.json
+  min_samples: 32
+  refit_interval: 8
+  max_samples: 2048
+  ridge: 0.01
+  min_path_samples: 16
+  min_validation_samples: 3
+  accept_ratio: 1.0
+
+diagnostics:
+  enabled: true
+  log_every: 100

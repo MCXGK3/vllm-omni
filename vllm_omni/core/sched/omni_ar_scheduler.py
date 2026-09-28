@@ -205,13 +205,19 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self.index+=1
         self.time=time()
         self.index_time[self.index]=self.time
-        if self.chunk_transfer_adapter:
+        # A scheduler wrapper may need to inspect only data-ready requests
+        # before entering this method.  In that case it preprocesses the
+        # async-chunk queues itself and owns the matching restore operation.
+        chunk_queues_preprocessed = bool(
+            getattr(self, "_omni_chunk_queues_preprocessed", False)
+        )
+        if self.chunk_transfer_adapter and not chunk_queues_preprocessed:
             self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
 
         try:
             scheduler_output = super().schedule()
         finally:
-            if self.chunk_transfer_adapter:
+            if self.chunk_transfer_adapter and not chunk_queues_preprocessed:
                 # Add request waiting for chunk to the waiting and running queue
                 self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
         try:
